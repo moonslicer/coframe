@@ -215,7 +215,7 @@ human pixels == agent pixels.)
   author's arm64 Mac; no headless browser). Render the marked SVG string to a ~1024px PNG, base64,
   send as an image content block. The same SVG string is pushed to the browser for the visible beat —
   the agent's eyes the viewer sees IS the bytes the model saw.
-- **LLM integration: Anthropic TypeScript SDK** (`@anthropic-ai/sdk`), model **`claude-opus-4-8`**,
+- **LLM integration: Anthropic TypeScript SDK** (`@anthropic-ai/sdk`), model **`claude-sonnet-4-6`**,
   `thinking: { type: 'adaptive' }`, a **manual** agentic loop, **streaming** via `messages.stream()`.
 - **Transport: single Node process** — a thin HTTP/WS server (Hono + `ws`) holding the authoritative
   graph in memory; the browser sends prompt+selection over one WebSocket and receives a typed event
@@ -315,7 +315,7 @@ friends** (see §8 open questions).
 - **Confine the SDK to one thin adapter** inside the agent module: build the tool-use request
   (8 schemas + system prompt + perception payload), call the SDK, return parsed tool-call intents. The
   loop's state machine consumes parsed intents and never touches the SDK, streaming format, or model id
-  directly. The model id (`claude-opus-4-8`) is a single constant.
+  directly. The model id (`claude-sonnet-4-6`) is a single constant.
 
 ### 4.6 Flexibility
 
@@ -706,7 +706,7 @@ deterministic, static literal schemas, nothing volatile interpolated.
 
 ### 5.4 Agent Loop + LLM Integration
 
-The runtime heart — a real Anthropic tool-use loop on `claude-opus-4-8`, streaming, with tier-1 verify
+The runtime heart — a real Anthropic tool-use loop on `claude-sonnet-4-6`, streaming, with tier-1 verify
 and bounded retry. A **manual** agentic loop (not the SDK tool-runner): every tool result must pass
 through boundary validation + structural verify *before* it goes back to the model, with the snapshot
 and per-call log emission in between — exactly the interception point the tool-runner hides.
@@ -779,7 +779,7 @@ async function runTask(rc: RunController, intent: string, selection: NodeId[]) {
 // agent/llmAdapter.ts — ALL @anthropic-ai/sdk usage lives here
 import Anthropic from '@anthropic-ai/sdk';
 const client = new Anthropic();                   // ANTHROPIC_API_KEY from .env
-const MODEL = 'claude-opus-4-8';
+const MODEL = 'claude-sonnet-4-6';
 const TOOLS = buildAnthropicTools();              // byte-stable, deterministically ordered -> cacheable
 for (const t of TOOLS) assertValidToolSchema(t);  // startup assertion
 
@@ -980,7 +980,7 @@ Every v1 seam was chosen to make the cut features additive — except undo, whic
 ### Open questions (decide before / during the build)
 
 - **Seed-doc token reality (decide before quoting cost/latency to friends).** Run
-  `client.messages.countTokens({ model: 'claude-opus-4-8', messages: [...] })` on the actual seed-doc
+  `client.messages.countTokens({ model: 'claude-sonnet-4-6', messages: [...] })` on the actual seed-doc
   skeleton + a 1024px marked render. The 3k/turn and ~$0.20/run numbers are spec estimates, not
   measurements. Also confirm the cached prefix clears the **4096-token** Opus 4.8 minimum (else caching
   silently no-ops).
