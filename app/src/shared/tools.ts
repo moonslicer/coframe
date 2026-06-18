@@ -384,6 +384,128 @@ register({
   label: (a) => `applyAutoLayout ${a.dir} gap=${a.gap ?? 16} on ${a.frame}`,
 });
 
+// ---------- Direct manipulation (client-driven edits) ----------
+register({
+  name: "setBBox",
+  schema: {
+    name: "setBBox",
+    description:
+      "Set the absolute position and size of a single node to [x,y,w,h] in canvas coords. Use this for a " +
+      "direct move or resize when you already know the exact target rectangle. For multi-node drags the " +
+      "client emits one call per node.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "NodeId to move/resize." },
+        bbox: {
+          type: "array",
+          items: { type: "number" },
+          description: "[x,y,w,h] in canvas coords — the new absolute rectangle.",
+        },
+      },
+      required: ["id", "bbox"],
+    },
+  },
+  validate: (a, s) => (s.has(a.id) ? null : badId(a.id)),
+  plan: (a) => [{ kind: "set", id: a.id, path: "bbox", value: a.bbox }],
+  label: (a) => `setBBox ${a.id}`,
+});
+
+register({
+  name: "deleteNodes",
+  schema: {
+    name: "deleteNodes",
+    description:
+      "Delete one or more nodes and their entire subtrees. Call this to remove elements from the design. " +
+      "The page root can never be deleted.",
+    input_schema: {
+      type: "object",
+      properties: {
+        ids: { type: "array", items: { type: "string" }, description: "NodeIds to delete." },
+      },
+      required: ["ids"],
+    },
+  },
+  validate: (a, s) => {
+    for (const id of a.ids) {
+      if (!s.has(id)) return badId(id);
+      if (id === s.rootId) return { error: "CONSTRAINT", detail: `cannot delete the page root ${id}` };
+    }
+    return null;
+  },
+  plan: (a) => a.ids.map((id: NodeId) => ({ kind: "remove", id })),
+  label: (a) => `deleteNodes ${a.ids.length} node(s)`,
+});
+
+register({
+  name: "reparentNodes",
+  schema: {
+    name: "reparentNodes",
+    description:
+      "Move a node to a new parent frame, inserting it at the given index (appended to the end by " +
+      "default). Use this to nest an element inside a different container. A node can never be reparented " +
+      "into itself or one of its own descendants.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "NodeId to move." },
+        parent: { type: "string", description: "NodeId of the new parent frame." },
+        index: { type: "number", description: "Child index to insert at. Omit to append." },
+      },
+      required: ["id", "parent"],
+    },
+  },
+  validate: (a, s) => {
+    if (!s.has(a.id)) return badId(a.id);
+    if (!s.has(a.parent)) return badId(a.parent);
+    if (a.parent === a.id) return { error: "CONSTRAINT", detail: "cannot reparent a node into itself" };
+    // cycle guard: reparenting into a descendant of id would corrupt the tree.
+    if (isDescendant(s, a.id, a.parent))
+      return { error: "CONSTRAINT", detail: `${a.parent} is a descendant of ${a.id}` };
+    return null;
+  },
+  plan: (a, s) => {
+    const p = s.getNode(a.parent)!;
+    const index = a.index ?? p.children.length;
+    return [{ kind: "reparent", id: a.id, parent: a.parent, index }];
+  },
+  label: (a) => `reparentNodes ${a.id} -> ${a.parent}`,
+});
+
+register({
+  name: "setText",
+  schema: {
+    name: "setText",
+    description: "Replace the text content (characters) of a TEXT node. Call this to edit a label, heading, or paragraph.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "NodeId of the TEXT node." },
+        chars: { type: "string", description: "The new text content." },
+      },
+      required: ["id", "chars"],
+    },
+  },
+  validate: (a, s) => {
+    if (!s.has(a.id)) return badId(a.id);
+    if (s.getNode(a.id)!.type !== "TEXT")
+      return { error: "CONSTRAINT", detail: `${a.id} is not a TEXT node` };
+    return null;
+  },
+  plan: (a) => [{ kind: "set", id: a.id, path: "text.chars", value: a.chars }],
+  label: (a) => `setText ${a.id}`,
+});
+
+/** True if `maybe` is `id` itself or anywhere in id's subtree (walk children). */
+function isDescendant(s: DocStore, id: NodeId, maybe: NodeId): boolean {
+  const n = s.getNode(id);
+  if (!n) return false;
+  for (const c of n.children) {
+    if (c === maybe || isDescendant(s, c, maybe)) return true;
+  }
+  return false;
+}
+
 function crossPos(
   frame: Node,
   kid: Node,

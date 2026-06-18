@@ -7,16 +7,107 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildSvg } from "../render/svg-build.js";
 import type { NodeId } from "../shared/types.js";
-import { docMirror, useDocVersion, useRunState } from "./stores.js";
-import { send } from "./ws.js";
+import {
+  docMirror,
+  getToolMode,
+  setToolMode,
+  useDocVersion,
+  useRunState,
+  useToolMode,
+} from "./stores.js";
+import { send, sendTool } from "./ws.js";
+import {
+  type BBox,
+  type HandleId,
+  clientToCanvas,
+  handlePositions,
+  moveBBox,
+  normalizeRect,
+  resizeBBox,
+} from "./canvas-math.js";
 
 const MARKS_FLASH_MS = 2600; // float briefly, then dock to the corner thumbnail
+const DRAG_THRESHOLD = 3; // screen px before a press becomes a move/resize (plain click still selects)
+const MIN_SIZE = 4; // minimum node w/h a resize may produce, in canvas px
+const HANDLE_PX = 8; // on-screen handle size; divided by `fit` so it stays constant
+const REPARENT_ECHO_TIMEOUT_MS = 1500; // wait this long for the setBBox echo before bailing
+
+// Default node size for a bare click (no rubber-band drag) in each create tool,
+// anchored at the click point. Tuned so a single tap drops a usable element.
+const CREATE_DEFAULTS: Record<string, [number, number]> = {
+  frame: [320, 360],
+  text: [200, 40],
+  rect: [120, 40],
+  ellipse: [120, 40],
+};
+
+// The in-flight pointer gesture. Null = idle. `kind:"select"` is a pending click that
+// only resolves on pointerup if no drag crossed the threshold. move/resize carry the
+// original bboxes so we can rebuild the override map from the running delta each move.
+type Gesture =
+  | {
+      kind: "select";
+      startClientX: number;
+      startClientY: number;
+      hit: NodeId | null; // node under the press (null = empty canvas)
+      additive: boolean;
+    }
+  | {
+      kind: "move" | "resize";
+      handle: HandleId | null; // resize handle, null for move
+      startX: number; // gesture start in CANVAS coords
+      startY: number;
+      startClientX: number;
+      startClientY: number;
+      orig: Map<NodeId, BBox>; // original bboxes of every affected node
+      dragging: boolean; // crossed the threshold yet?
+      reparentTarget: NodeId | null; // valid drop-into FRAME under cursor (single-select moves only)
+    }
+  | {
+      // A create-tool rubber-band: draws a LOCAL preview rect only; the real node is
+      // minted server-side on pointerup (it doesn't exist yet, so nothing to preview
+      // via docMirror — we render the dashed box directly).
+      kind: "create";
+      tool: Exclude<ReturnType<typeof getToolMode>, "select">;
+      startX: number; // start corner in CANVAS coords
+      startY: number;
+      startClientX: number;
+      startClientY: number;
+      parent: NodeId; // deepest FRAME under the START point (resolved on pointerdown)
+      rect: BBox | null; // live preview rect (null until the first move)
+    };
+
+// Per-handle cursor so the affordance reads correctly. Diagonal handles get the
+// matching resize cursor; edges get the axis cursor.
+const HANDLE_CURSOR: Record<HandleId, string> = {
+  nw: "nwse-resize",
+  se: "nwse-resize",
+  ne: "nesw-resize",
+  sw: "nesw-resize",
+  n: "ns-resize",
+  s: "ns-resize",
+  e: "ew-resize",
+  w: "ew-resize",
+};
 
 export function Canvas() {
   const version = useDocVersion(); // re-render on every mirror mutation OR selection change
   const run = useRunState();
+  const toolMode = useToolMode(); // active create tool (drives the crosshair cursor)
   const [flashMarks, setFlashMarks] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  // The transform:scale(fit) STAGE div — its getBoundingClientRect() already reflects
+  // the scale and centering, so clientToCanvas divides by `fit` against THIS rect.
+  const stageRef = useRef<HTMLDivElement>(null);
+  // The live gesture lives in a ref (not state): pointermove fires faster than React
+  // re-renders, and we drive the preview imperatively via docMirror, not via setState.
+  const gestureRef = useRef<Gesture | null>(null);
+  // Overlay state for gestures that DON'T have a doc node to preview through the
+  // mirror: the create rubber-band rect and the current reparent drop-target frame.
+  // These DO need a re-render, so they live in React state (low-frequency relative
+  // to bbox previews, which still go through docMirror.previewBboxes).
+  const [createRect, setCreateRect] = useState<BBox | null>(null);
+  const [reparentTarget, setReparentTarget] = useState<NodeId | null>(null);
 
   // Selection lives in the single doc-mirror source (drives this layer, the prompt
   // placeholder, and the id set shipped with the prompt) — never a local copy.
@@ -74,14 +165,16 @@ export function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run.marks?.at, version]);
 
-  function onClick(e: React.MouseEvent) {
-    if (runActive) return; // selection disabled mid-run (single-writer guard)
-    const target = (e.target as Element).closest("[data-node-id]");
-    const id = target?.getAttribute("data-node-id") as NodeId | null;
-    const hit = id && id !== docMirror.store.rootId ? id : null;
-    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
-    const cur = docMirror.selection;
+  // Map a client point to canvas coords against the SCALED stage rect + viewBox origin.
+  function toCanvas(clientX: number, clientY: number): [number, number] {
+    const rect = stageRef.current?.getBoundingClientRect() ?? { left: 0, top: 0 };
+    const [vx, vy] = viewBoxDims();
+    return clientToCanvas(clientX, clientY, rect, fit, vx, vy);
+  }
 
+  // Resolve a no-drag press into a selection change (the OLD onClick logic verbatim).
+  function resolveSelectClick(hit: NodeId | null, additive: boolean) {
+    const cur = docMirror.selection;
     let next: NodeId[];
     if (!hit) {
       // Click on empty canvas / the root frame clears the selection.
@@ -93,15 +186,305 @@ export function Canvas() {
       // Plain click selects just that node.
       next = [hit];
     }
-
     docMirror.setSelection(next);
     send({ t: "select", ids: next });
   }
 
+  // Walk UP from a DOM element to the nearest ancestor that is a FRAME node, mapping
+  // each data-node-id to its mirror node and stopping at the first FRAME. `exclude`
+  // skips ids (the dragged node itself + its descendants + its current parent) so a
+  // reparent never targets an invalid frame. Returns null if none qualifies.
+  function frameUnder(el: Element | null, exclude?: Set<NodeId>): NodeId | null {
+    let cur: Element | null = el;
+    while (cur) {
+      const node = cur.closest("[data-node-id]");
+      if (!node) return null;
+      const id = node.getAttribute("data-node-id") as NodeId | null;
+      if (id) {
+        if (!exclude?.has(id) && docMirror.store.getNode(id)?.type === "FRAME") return id;
+        // Not a (valid) frame — keep climbing from this node's parent.
+        cur = node.parentElement;
+        continue;
+      }
+      cur = node.parentElement;
+    }
+    return null;
+  }
+
+  // Collect a node id + its entire subtree (for the reparent exclusion set).
+  function subtreeIds(id: NodeId, into: Set<NodeId>) {
+    into.add(id);
+    const n = docMirror.store.getNode(id);
+    if (n) for (const c of n.children) subtreeIds(c, into);
+  }
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (runActive) return; // all gestures disabled mid-run (single-writer guard)
+    const el = e.target as Element;
+    const cur = docMirror.selection;
+
+    // 0) A create tool is active → start a rubber-band that mints a new node on up.
+    //    The parent is the deepest FRAME under the START point (root as fallback).
+    const tool = getToolMode();
+    if (tool !== "select") {
+      const [sx, sy] = toCanvas(e.clientX, e.clientY);
+      const parent = frameUnder(el) ?? docMirror.store.rootId;
+      gestureRef.current = {
+        kind: "create",
+        tool,
+        startX: sx,
+        startY: sy,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        parent,
+        rect: null,
+      };
+      setCreateRect(null);
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // 1) A resize handle (only rendered for single selection) → begin resize.
+    const handleEl = el.closest("[data-handle]");
+    if (handleEl && cur.length === 1) {
+      const handle = handleEl.getAttribute("data-handle") as HandleId;
+      const n = docMirror.store.getNode(cur[0]);
+      if (n) {
+        const [sx, sy] = toCanvas(e.clientX, e.clientY);
+        gestureRef.current = {
+          kind: "resize",
+          handle,
+          startX: sx,
+          startY: sy,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          orig: new Map([[n.id, n.bbox as BBox]]),
+          dragging: false,
+          reparentTarget: null,
+        };
+        (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      }
+      return;
+    }
+
+    // 2) A node already in the selection → begin a potential move of ALL selected.
+    const nodeEl = el.closest("[data-node-id]");
+    const nodeId = nodeEl?.getAttribute("data-node-id") as NodeId | null;
+    const hit = nodeId && nodeId !== docMirror.store.rootId ? nodeId : null;
+    if (hit && cur.includes(hit)) {
+      const orig = new Map<NodeId, BBox>();
+      for (const id of cur) {
+        const n = docMirror.store.getNode(id);
+        if (n) orig.set(id, n.bbox as BBox);
+      }
+      const [sx, sy] = toCanvas(e.clientX, e.clientY);
+      gestureRef.current = {
+        kind: "move",
+        handle: null,
+        startX: sx,
+        startY: sy,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        orig,
+        dragging: false,
+        reparentTarget: null,
+      };
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // 3) Anything else → a pending selection click, resolved on pointerup if no drag.
+    gestureRef.current = {
+      kind: "select",
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      hit,
+      additive: e.shiftKey || e.metaKey || e.ctrlKey,
+    };
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+  }
+
+  function onPointerMove(e: React.PointerEvent) {
+    const g = gestureRef.current;
+    if (!g || runActive) return;
+
+    const movedPx =
+      Math.abs(e.clientX - g.startClientX) + Math.abs(e.clientY - g.startClientY);
+
+    if (g.kind === "select") {
+      // A pending click never previews; it just waits for pointerup. (Crossing the
+      // threshold here would mean a drag on an unselected node — we leave it a click.)
+      return;
+    }
+
+    const [cx, cy] = toCanvas(e.clientX, e.clientY);
+
+    if (g.kind === "create") {
+      // Live rubber-band preview drawn directly (no doc node exists yet).
+      const rect = normalizeRect(g.startX, g.startY, cx, cy, MIN_SIZE);
+      g.rect = rect;
+      setCreateRect(rect);
+      return;
+    }
+
+    // Only begin manipulating once past the threshold, so a plain click on a selected
+    // node doesn't micro-nudge it.
+    if (!g.dragging && movedPx <= DRAG_THRESHOLD) return;
+    g.dragging = true;
+
+    const dx = cx - g.startX;
+    const dy = cy - g.startY;
+
+    const overrides = new Map<NodeId, BBox>();
+    if (g.kind === "move") {
+      for (const [id, bbox] of g.orig) overrides.set(id, moveBBox(bbox, dx, dy));
+      // Drag-to-reparent (single selected node only): highlight the FRAME under the
+      // cursor that is a VALID new parent — not the node itself, not its descendants,
+      // not its current parent. Multi-select moves never reparent.
+      let target: NodeId | null = null;
+      if (g.orig.size === 1) {
+        const draggedId = [...g.orig.keys()][0];
+        const dragged = docMirror.store.getNode(draggedId);
+        const exclude = new Set<NodeId>();
+        subtreeIds(draggedId, exclude); // self + descendants (mirrors the server cycle guard)
+        if (dragged?.parent) exclude.add(dragged.parent); // already there → no-op move
+        target = frameUnder(e.target as Element, exclude);
+      }
+      if (target !== g.reparentTarget) {
+        g.reparentTarget = target;
+        setReparentTarget(target);
+      }
+    } else {
+      for (const [id, bbox] of g.orig)
+        overrides.set(id, resizeBBox(bbox, g.handle!, dx, dy, MIN_SIZE));
+    }
+    docMirror.previewBboxes(overrides); // LIVE feedback only — nothing sent yet
+  }
+
+  function onPointerUp(e: React.PointerEvent) {
+    const g = gestureRef.current;
+    gestureRef.current = null;
+    try {
+      (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+    } catch {
+      /* capture may already be gone */
+    }
+    if (!g || runActive) return;
+
+    if (g.kind === "create") {
+      // Compute the new node's bbox: the rubber-band rect, or a sensible default size
+      // anchored at the click point when it was a bare click (no drag).
+      const [dw, dh] = CREATE_DEFAULTS[g.tool];
+      const bbox: BBox = g.rect ?? [g.startX, g.startY, dw, dh];
+      const parent = g.parent;
+      // Auto-select the node on the server echo, then dispatch the matching create.
+      docMirror.selectNextAdded();
+      if (g.tool === "frame") sendTool("createFrame", { parent, bbox });
+      else if (g.tool === "text") sendTool("createText", { parent, chars: "Text", bbox });
+      else if (g.tool === "rect") sendTool("createShape", { parent, kind: "RECT", bbox });
+      else if (g.tool === "ellipse") sendTool("createShape", { parent, kind: "ELLIPSE", bbox });
+      setCreateRect(null);
+      setToolMode("select"); // single-use create tool → revert to select after one drop
+      return;
+    }
+
+    if (g.kind === "select") {
+      // No-drag press → resolve the selection click with the preserved modifiers.
+      resolveSelectClick(g.hit, g.additive);
+      return;
+    }
+
+    if (!g.dragging) {
+      // A press on a selected node that never moved past the threshold → treat as a
+      // plain click that re-selects just that node (matching single-click behavior).
+      const id = [...g.orig.keys()][0];
+      if (g.kind === "move") resolveSelectClick(id ?? null, false);
+      return;
+    }
+
+    // Capture the reparent target before we clear the overlay state.
+    const target = g.kind === "move" ? g.reparentTarget : null;
+    setReparentTarget(null);
+
+    // A real drag committed: send one setBBox per affected node (setBBox is single-id).
+    // The server's ops-applied echo snaps the mirror back to authoritative truth.
+    const bboxes: { id: NodeId; bbox: BBox }[] = [];
+    for (const [id] of g.orig) {
+      const n = docMirror.store.getNode(id);
+      if (n) bboxes.push({ id, bbox: n.bbox as BBox });
+    }
+    for (const b of bboxes) sendTool("setBBox", b);
+
+    // Drag-to-reparent: a single node dropped into a valid new frame. We must send
+    // setBBox FIRST (above), then reparent — but reparent's baseVersion would be
+    // STALE if we fired it immediately, because sendTool reads docMirror.version,
+    // which only advances when the server echoes the setBBox. So we AWAIT the echo
+    // (docMirror.nextOpsApplied) before sending reparent, racing it against a timeout
+    // so a missing echo can't hang the gesture — on timeout we skip and resync.
+    if (target && bboxes.length === 1) {
+      const id = bboxes[0].id;
+      const echoed = Symbol("echoed");
+      const timedOut = Symbol("timedout");
+      Promise.race([
+        docMirror.nextOpsApplied().then(() => echoed),
+        new Promise<typeof timedOut>((res) =>
+          setTimeout(() => res(timedOut), REPARENT_ECHO_TIMEOUT_MS),
+        ),
+      ]).then((winner) => {
+        if (winner === echoed) {
+          sendTool("reparentNodes", { id, parent: target }); // fresh baseVersion now
+        } else {
+          send({ t: "resync" }); // echo never arrived → re-anchor to authoritative truth
+        }
+      });
+    }
+  }
+
+  // Escape cancels an in-flight drag: restore the originals locally, send nothing.
+  // Delete/Backspace deletes the selection (unless typing in an input — future inspector).
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (runActive) return; // no keyboard gestures mid-run
+      const g = gestureRef.current;
+      if (e.key === "Escape" && g) {
+        if (g.kind === "create") {
+          gestureRef.current = null;
+          setCreateRect(null);
+          setToolMode("select");
+          return;
+        }
+        if (g.kind !== "select" && g.dragging) {
+          docMirror.previewBboxes(g.orig); // snap back to where the drag began
+          setReparentTarget(null);
+          gestureRef.current = null;
+          return;
+        }
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        const sel = docMirror.selection;
+        if (!sel.length) return;
+        const ae = document.activeElement;
+        const tag = ae?.tagName;
+        const typing =
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          (ae as HTMLElement | null)?.isContentEditable;
+        if (typing) return;
+        e.preventDefault();
+        sendTool("deleteNodes", { ids: sel });
+        docMirror.clearSelection();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [runActive]);
+
   return (
     <div
       ref={containerRef}
-      onClick={onClick}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
       style={{
         position: "relative",
         width: "100%",
@@ -112,7 +495,7 @@ export function Canvas() {
         alignItems: "center",
         padding: 24,
         boxSizing: "border-box",
-        cursor: runActive ? "default" : "pointer",
+        cursor: runActive ? "default" : toolMode !== "select" ? "crosshair" : "pointer",
       }}
     >
       {/* Sizing box reserves the SCALED footprint so the transform-scaled stage
@@ -127,6 +510,7 @@ export function Canvas() {
         }}
       >
         <div
+          ref={stageRef}
           style={{
             position: "absolute",
             left: 0,
@@ -139,8 +523,13 @@ export function Canvas() {
           {/* The injected SVG string — the SAME bytes the rasterizer consumes. */}
           <div dangerouslySetInnerHTML={{ __html: svg }} />
 
-          {/* Selection outline(s), absolutely positioned in the SVG's coord space. */}
-          <SelectionLayer selection={selection} />
+          {/* Selection outline(s) + resize handles, in the SVG's coord space. */}
+          <SelectionLayer selection={selection} fit={fit} runActive={runActive} />
+
+          {/* Transient gesture overlay: create rubber-band + reparent drop target. */}
+          {(createRect || reparentTarget) && (
+            <GestureOverlay createRect={createRect} reparentTarget={reparentTarget} fit={fit} />
+          )}
 
           {/* Marks beat overlay — transient, from the live mirror bboxes. */}
           {flashMarks && <MarksLayer boxes={markBoxes} />}
@@ -174,9 +563,22 @@ function viewBoxDims() {
   return root ? root.bbox : [0, 0, 0, 0];
 }
 
-function SelectionLayer({ selection }: { selection: NodeId[] }) {
+function SelectionLayer({
+  selection,
+  fit,
+  runActive,
+}: {
+  selection: NodeId[];
+  fit: number;
+  runActive: boolean;
+}) {
   const [vx, vy, vw, vh] = viewBoxDims();
   if (!selection.length) return null;
+  // Handles only for a single, manipulable selection (resizeBBox is single-node and
+  // setBBox is single-id). Sized in SCREEN px by dividing the constant by `fit`.
+  const single = selection.length === 1 ? docMirror.store.getNode(selection[0]) : null;
+  const showHandles = !!single && !runActive;
+  const hs = HANDLE_PX / fit; // handle side length in canvas units → ~HANDLE_PX on screen
   return (
     <svg
       viewBox={`${vx} ${vy} ${vw} ${vh}`}
@@ -214,6 +616,75 @@ function SelectionLayer({ selection }: { selection: NodeId[] }) {
           </g>
         );
       })}
+      {showHandles &&
+        handlePositions(single!.bbox as BBox).map(({ id, cx, cy }) => (
+          // pointerEvents:"auto" so ONLY the handle rects are hit-testable (the svg
+          // layer stays pointerEvents:"none" so node bodies remain clickable below it).
+          <rect
+            key={id}
+            data-handle={id}
+            x={cx - hs / 2}
+            y={cy - hs / 2}
+            width={hs}
+            height={hs}
+            fill="#fff"
+            stroke="#2563eb"
+            strokeWidth={1 / fit}
+            style={{ pointerEvents: "auto", cursor: HANDLE_CURSOR[id] }}
+          />
+        ))}
+    </svg>
+  );
+}
+
+// Transient overlay for the create rubber-band (a dashed blue rect) and the
+// reparent drop-target (a dashed green outline around the FRAME we'd drop into).
+// Both draw in the SVG's viewBox coord space, pointerEvents off so nothing blocks
+// the gesture below.
+function GestureOverlay({
+  createRect,
+  reparentTarget,
+  fit,
+}: {
+  createRect: BBox | null;
+  reparentTarget: NodeId | null;
+  fit: number;
+}) {
+  const [vx, vy, vw, vh] = viewBoxDims();
+  const target = reparentTarget ? docMirror.store.getNode(reparentTarget) : null;
+  return (
+    <svg
+      viewBox={`${vx} ${vy} ${vw} ${vh}`}
+      width={vw}
+      height={vh}
+      style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none" }}
+    >
+      {target && (
+        <rect
+          x={target.bbox[0]}
+          y={target.bbox[1]}
+          width={target.bbox[2]}
+          height={target.bbox[3]}
+          fill="#22c55e"
+          fillOpacity={0.08}
+          stroke="#16a34a"
+          strokeWidth={2 / fit}
+          strokeDasharray={`${6 / fit} ${4 / fit}`}
+        />
+      )}
+      {createRect && (
+        <rect
+          x={createRect[0]}
+          y={createRect[1]}
+          width={createRect[2]}
+          height={createRect[3]}
+          fill="#2563eb"
+          fillOpacity={0.08}
+          stroke="#2563eb"
+          strokeWidth={1.5 / fit}
+          strokeDasharray={`${6 / fit} ${4 / fit}`}
+        />
+      )}
     </svg>
   );
 }

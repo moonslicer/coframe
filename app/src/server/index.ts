@@ -12,6 +12,8 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { WebSocketServer, WebSocket } from "ws";
 import { DocStore } from "../shared/store.js";
+import { dispatch } from "../shared/tools.js";
+import { isErr } from "../shared/types.js";
 import { getSeed, DEFAULT_SEED_ID } from "../shared/seed.js";
 import { RunController } from "../agent/run-controller.js";
 import { runTask } from "../agent/loop.js";
@@ -120,14 +122,45 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
       return;
     }
 
+    case "tool": {
+      // Human direct-manipulation edit. Editing is LOCKED during agent runs.
+      if (runActive()) {
+        send(ws, { t: "rejected", reason: "A run is in progress." });
+        return;
+      }
+      // Undo coalescing: capture the snapshot ONLY when none is pending.
+      if (!lastSnapshot) {
+        lastSnapshot = store.snapshot();
+        lastRunVersion = store.version;
+      }
+      // args are untrusted `unknown` — dispatch may throw on malformed input.
+      let r;
+      try {
+        r = dispatch(msg.name, msg.args, store, msg.baseVersion);
+      } catch (e) {
+        send(ws, { t: "rejected", reason: `Tool error: ${(e as Error).message}` });
+        return;
+      }
+      if (isErr(r)) {
+        send(ws, { t: "rejected", reason: `${r.error}: ${r.detail}` });
+        return;
+      }
+      // Success reuses the ops-applied frame; NO activityId for human edits.
+      send(ws, { t: "ops-applied", ops: r.ops, version: r.version });
+      return;
+    }
+
     case "prompt": {
       if (runActive()) {
         send(ws, { t: "rejected", reason: "A run is already in progress." });
         return;
       }
-      // Capture the pre-run snapshot on the server so undo can restore it.
-      lastSnapshot = store.snapshot();
-      lastRunVersion = store.version;
+      // Capture the pre-run snapshot on the server so undo can restore it. Guarded
+      // so a human edit followed by a run coalesces into one undo level.
+      if (!lastSnapshot) {
+        lastSnapshot = store.snapshot();
+        lastRunVersion = store.version;
+      }
 
       const rc = new RunController();
       activeRC = rc;

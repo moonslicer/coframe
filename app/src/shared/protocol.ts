@@ -17,7 +17,8 @@ export type ClientMessage =
   | { t: "undo" }
   | { t: "select"; ids: NodeId[] }
   | { t: "loadSeed"; seedDocId: string }
-  | { t: "resync" };
+  | { t: "resync" }
+  | { t: "tool"; name: string; args: unknown; baseVersion: DocVersion };
 
 // ---- server -> client ----
 // Full doc-state frames (transport-level, not run-level).

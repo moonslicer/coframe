@@ -5,6 +5,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Canvas } from "./Canvas.js";
+import { Toolbar } from "./Toolbar.js";
+import { Inspector } from "./Inspector.js";
 import { docMirror, useDocVersion, useRunState } from "./stores.js";
 import type { ActivityEntry } from "./stores.js";
 import { connect, send } from "./ws.js";
@@ -114,6 +116,9 @@ export function App() {
 
       <main style={{ gridArea: "canvas", minHeight: 0, position: "relative" }}>
         <Canvas />
+        <div style={{ position: "absolute", top: 12, left: 12, zIndex: 20 }}>
+          <Toolbar />
+        </div>
       </main>
 
       <aside
@@ -126,6 +131,9 @@ export function App() {
           minHeight: 0,
         }}
       >
+        <Section title="Properties">
+          <Inspector />
+        </Section>
         <Section title="Activity">
           <ActivityLog activity={run.activity} phase={run.phase} />
         </Section>

@@ -15,7 +15,11 @@
     "smoke:loop": "tsx src/agent/run.test-smoke.ts",
     "smoke:eval": "tsx src/agent/eval.test-smoke.ts",
     "smoke:tokens": "tsx src/agent/count-tokens.test-smoke.ts",
-    "smoke:server": "tsx src/server/server.test-smoke.ts"
+    "smoke:server": "tsx src/server/server.test-smoke.ts",
+    "smoke:tool": "tsx src/server/tool.test-smoke.ts",
+    "smoke:tools": "tsx src/shared/tools.test-smoke.ts",
+    "smoke:toolmode": "tsx src/client/toolmode.test-smoke.ts",
+    "smoke:canvas-math": "tsx src/client/canvas-math.test-smoke.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.5",

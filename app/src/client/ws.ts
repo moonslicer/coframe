@@ -74,3 +74,9 @@ export function send(msg: ClientMessage): void {
   }
   sendWhenOpen(msg);
 }
+
+// Human tool edit: read the current authoritative version off the mirror for the
+// optimistic-concurrency baseVersion the server checks against.
+export function sendTool(name: string, args: unknown): void {
+  sendWhenOpen({ t: "tool", name, args, baseVersion: docMirror.version });
+}

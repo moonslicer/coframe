@@ -9,6 +9,7 @@ import { useSyncExternalStore } from "react";
 import { DocStore } from "../shared/store.js";
 import { applyOps } from "../shared/store.js";
 import type { Node, NodeId, Op } from "../shared/types.js";
+import type { BBox } from "./canvas-math.js";
 import type { RunPhase } from "../agent/run-controller.js";
 import type { ServerMessage } from "../shared/protocol.js";
 
@@ -23,6 +24,10 @@ class DocMirror {
   version = 0; // authoritative doc version (display); changes on every doc mutation
   private tick = 0; // monotonic snapshot primitive — bumps on ANY change (doc OR selection)
   private listeners = new Set<() => void>();
+  // One-shot resolvers drained the next time applyOps runs (server-echo sequencing).
+  private opsAppliedWaiters = new Set<() => void>();
+  // One-shot flag: select the node added by the NEXT applyOps that contains an `add`.
+  private selectNextAddedFlag = false;
 
   subscribe = (fn: () => void) => {
     this.listeners.add(fn);
@@ -56,7 +61,40 @@ class DocMirror {
       nodes: [...next.values()],
     });
     this.version = version;
-    this.notify();
+    // Auto-select a freshly-created node: if the create flag is set AND this echo
+    // carries an `add`, select it. Runs AFTER the nodes are patched in above so the
+    // SelectionLayer can resolve the new id. setSelection() notifies for us.
+    if (this.selectNextAddedFlag) {
+      const added = ops.find((o) => o.kind === "add");
+      this.selectNextAddedFlag = false;
+      if (added && added.kind === "add") {
+        this.setSelection([added.node.id]);
+      } else {
+        this.notify();
+      }
+    } else {
+      this.notify();
+    }
+    // Drain any awaiters of "the next applied ops" (setBBox -> reparent sequencing).
+    if (this.opsAppliedWaiters.size) {
+      const waiters = [...this.opsAppliedWaiters];
+      this.opsAppliedWaiters.clear();
+      for (const w of waiters) w();
+    }
+  }
+
+  // A ONE-SHOT promise that resolves the next time applyOps runs (i.e. the server
+  // echoed an ops-applied frame and this.version advanced). Used to await the echo
+  // before sending a dependent tool call (e.g. setBBox THEN reparent) so the second
+  // call's baseVersion isn't stale. CAUTION: if no echo ever arrives this never
+  // resolves — callers MUST race it against a timeout (and resync on timeout).
+  nextOpsApplied(): Promise<void> {
+    return new Promise((resolve) => this.opsAppliedWaiters.add(resolve));
+  }
+
+  // Arm a one-shot: the next applyOps carrying an `add` selects the added node.
+  selectNextAdded() {
+    this.selectNextAddedFlag = true;
   }
 
   setSelection(ids: NodeId[]) {
@@ -68,6 +106,21 @@ class DocMirror {
     if (this.selection.length === 0) return;
     this.selection = [];
     this.notify();
+  }
+
+  // LOCAL preview for direct-manipulation drags: re-seed the store with overridden
+  // bboxes for live feedback, WITHOUT bumping this.version. The authoritative version
+  // only changes when the server echoes ops-applied on commit — a preview is purely
+  // optimistic-local and must not be mistaken for an applied mutation.
+  previewBboxes(overrides: Map<NodeId, BBox>) {
+    const nodes = [...this.store.all().values()].map((n) =>
+      overrides.has(n.id) ? { ...n, bbox: overrides.get(n.id)! } : n,
+    );
+    // NOTE: loadSeed resets the INTERNAL store._version to 1 — harmless because
+    // sendTool's baseVersion reads docMirror.version (this.version), never
+    // store.version. Do NOT wire baseVersion to store.version or drags will 400.
+    this.store.loadSeed({ rootId: this.store.rootId, nodes });
+    this.notify(); // deliberately does NOT touch this.version — local preview only
   }
 }
 
@@ -238,4 +291,44 @@ export const runStore = new RunStore();
 
 export function useRunState(): RunState {
   return useSyncExternalStore(runStore.subscribe, runStore.getState);
+}
+
+// ---------------------------------------------------------------------------
+// Tool mode — which canvas tool the human has active (select / draw shapes).
+// A minimal external store: the snapshot is the mode STRING itself (a stable
+// primitive), so useSyncExternalStore never tears or loops.
+// ---------------------------------------------------------------------------
+export type ToolMode = "select" | "frame" | "text" | "rect" | "ellipse";
+
+class ToolModeStore {
+  private mode: ToolMode = "select";
+  private listeners = new Set<() => void>();
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  };
+  // Snapshot getter: returns the primitive mode (stable across reads).
+  getSnapshot = (): ToolMode => this.mode;
+  // Plain getter for event handlers outside React.
+  getToolMode = (): ToolMode => this.mode;
+
+  setToolMode(m: ToolMode) {
+    if (this.mode === m) return; // no-op on unchanged, like clearSelection
+    this.mode = m;
+    for (const l of this.listeners) l();
+  }
+}
+
+export const toolModeStore = new ToolModeStore();
+
+export function getToolMode(): ToolMode {
+  return toolModeStore.getToolMode();
+}
+export function setToolMode(m: ToolMode): void {
+  toolModeStore.setToolMode(m);
+}
+
+export function useToolMode(): ToolMode {
+  return useSyncExternalStore(toolModeStore.subscribe, toolModeStore.getSnapshot);
 }
