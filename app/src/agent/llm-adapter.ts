@@ -283,8 +283,10 @@ export type ActDelta =
   | { kind: "thinking" };
 export type OnActDelta = (d: ActDelta) => void;
 
-/** Build the volatile per-turn user content: tree text + marked image + markMap. */
-function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
+/** Build the volatile per-turn user content: tree text + marked image + markMap.
+ *  Exported so the loop can persist it into rc.messages as a user turn BEFORE act
+ *  (so every request — incl. retries and step 2+ — starts with a user turn). */
+export function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
   const blocks: ContentBlockParam[] = [];
   blocks.push({
     type: "text",
@@ -319,7 +321,6 @@ function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
  */
 export async function act(
   messages: Anthropic.MessageParam[],
-  ctx: ActContext,
   onDelta?: OnActDelta,
 ): Promise<ActResult> {
   const params: Anthropic.MessageCreateParamsStreaming = {
@@ -327,7 +328,7 @@ export async function act(
     max_tokens: 8000,
     system: cachedSystem(SYSTEM_PROMPT),
     tools: TOOLS, // byte-stable, deterministically ordered -> cacheable
-    messages: [...messages, { role: "user", content: perceptionBlocks(ctx) }],
+    messages, // perception now lives in history (pushed by the loop before act)
     stream: true,
   };
   // pinned SDK types lag the API: adaptive thinking + effort (cast via any).

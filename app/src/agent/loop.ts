@@ -17,6 +17,7 @@ import { getTree, fieldsFor, render } from "../render/perception.js";
 import type { TaskHint } from "../render/perception.js";
 import { verifyStructural } from "./verify.js";
 import type { RunController } from "./run-controller.js";
+import { perceptionBlocks } from "./llm-adapter.js";
 import type { ContentBlockParam, ActDelta } from "./llm-adapter.js";
 import type { Step } from "./types.js";
 
@@ -127,6 +128,10 @@ export async function runTask(
       // PERCEIVE: fresh scoped re-read each step (no getChanges)
       rc.transition("PERCEIVING");
       const tree = getTree(store, rootId, { depth: 5, fields: fieldsFor(hintFor(step)) });
+      if ("error" in tree) {
+        store.restore(rc.snapshot);
+        return rc.finishEscalated(`Lost the working frame (${tree.detail}).`);
+      }
       const r = await render(store, rootId, { marks: true, maxPx: 1024 });
       if ("error" in r) {
         store.restore(rc.snapshot);
@@ -160,11 +165,11 @@ export async function runTask(
         // (args deltas are observed by the stream but the final label is derived
         //  from the fully-parsed tu.input at dispatch time — no partial-JSON parse.)
       };
-      const turn = await act(
-        rc.messages,
-        { tree, image, markMap: r.markMap, version: r.version, step },
-        onDelta,
-      );
+      // Persist the per-turn perception as a user turn BEFORE act, so the request
+      // ALWAYS starts with a user turn (otherwise call #2+ would begin with the prior
+      // assistant tool_use turn -> Anthropic 400 "first message must be user").
+      rc.pushUser(perceptionBlocks({ tree, image, markMap: r.markMap, version: r.version, step }));
+      const turn = await act(rc.messages, onDelta);
       if (turn.stopReason === "refusal") {
         store.restore(rc.snapshot);
         return rc.finishEscalated("The model declined the request.");
