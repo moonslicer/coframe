@@ -1,0 +1,19 @@
+{
+  "name": "agentic-canvas-headless-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Day 1-2 'prove the bet first' slice: scene graph + 8 semantic tools + a real Anthropic tool-use loop. No UI, no rendering.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.69.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

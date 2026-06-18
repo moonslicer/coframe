@@ -1,0 +1,45 @@
+/* Browser side of the font-fidelity guarantee (IMPLEMENTATION.md §5.2, §8 risk #3).
+ *
+ * The on-screen SVG <text> and the server-rasterized PNG must resolve the SAME
+ * Inter face. resvg loads the static Inter TTFs from src/assets; the browser loads
+ * the variable Inter face here. Vite resolves the ?url import to a hashed asset.
+ *
+ * "Inter" is named first in every <text font-family> in the draw table so the
+ * browser cannot silently fall back to a system default on exactly the pixels this
+ * risk is about. */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900; /* variable: covers all weights the draw table emits */
+  font-display: swap;
+  src: url("../assets/InterVariable.woff2") format("woff2");
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+
+/* The running-line pulse on the activity log / phase badge. */
+.pulse-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #7c3aed;
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.7);
+  }
+}

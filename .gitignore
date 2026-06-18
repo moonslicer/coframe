@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secrets / local env
+.env
+.env.local
+*.local
+
+# Scratch
+tmp/
+.ship/
+
+# OS / editor
+.DS_Store
+
+# Claude runtime
+.claude/scheduled_tasks.lock
