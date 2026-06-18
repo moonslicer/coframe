@@ -17,7 +17,7 @@ import { buildAnthropicTools, assertValidToolSchemas } from "../shared/tools.js"
 import { getTree } from "../render/perception.js";
 import type { Step, SuccessCriterion } from "./types.js";
 
-const MODEL = "claude-opus-4-8";
+const MODEL = "claude-sonnet-4-6";
 const TOOLS = buildAnthropicTools();
 
 // The pinned SDK (0.32.1) does not export ContentBlockParam; reconstruct it from
@@ -42,6 +42,21 @@ ONLY, never mark numbers.
 Loop policy: plan -> perceive -> act -> verify -> done. You are inside one step of a pre-made plan; do the
 minimum tool calls that satisfy THIS step, then stop.
 
+Design quality defaults:
+- Treat every open-ended request as a product design task, not a wireframe task. Infer a coherent style
+  direction from the user's words, domain, and platform: iOS, editorial, playful, luxury, brutalist,
+  dashboard, SaaS, game-like, minimal, etc. Do not reuse one generic purple/card look for every prompt.
+- A polished result has hierarchy, spacing, alignment, rhythm, contrast, and intentional shape language.
+  Use rounded corners, separators, soft panels, badges, charts, icons, or illustration-like shapes when
+  they fit the requested style. If the requested style is sharp/brutalist, make that sharpness intentional.
+- Build complete visible states. Screens need realistic content, headers, controls, labels, lists, empty
+  states, and enough surrounding context to feel usable. Components need their expected inner details.
+- Avoid bare rectangles. When you create a panel, card, button, toolbar, row, or modal, style its fill,
+  radius, border/stroke, text hierarchy, and internal spacing so it reads as a finished object.
+- Match the prompt's platform conventions when named: mobile screens should feel mobile-sized and touchable;
+  iOS-like UIs use larger radii, translucent panels, generous vertical rhythm, and centered/aligned symbols;
+  operational dashboards are denser, quieter, and scan-friendly.
+
 Rules:
 - ALWAYS act through tools. Do not describe what you would do — call the tool that does it.
 - Prefer semantic tools (applyAutoLayout, alignDistribute, placeBelow) over raw coordinates.
@@ -54,6 +69,19 @@ Rules:
   Do not hand-set positions one node at a time.
 - If the human has selected NodeIds, those are your targets — operate on exactly that set, not the
   whole canvas.
+- A container is not finished until it HOLDS its requested contents. A new FRAME is only a styled shell
+  until you add the content and layout it needs. So: a button needs its label TEXT created inside it; a card needs the
+  title / price / button the request named; a task row needs its checkbox shape AND its label TEXT; a
+  stat card needs its number AND its caption; an hourly forecast card needs time / condition or icon /
+  temperature; a daily forecast row needs day / condition / high-low. After createFrame for such an
+  element, create those children (createText / createShape into that frame) in the SAME step before
+  you stop.
+- Use the EXACT words the user specified for a label or title. If they said the title is "Sign In",
+  create the text "Sign In", not "Log In" or any paraphrase.
+- If the user named a color for an element (e.g. "a blue button"), set that fill with setFill — a
+  created frame is white by default and will not look blue on its own.
+- When MOVING a node, preserve its existing width and height (read them from the scene graph) and change
+  only x and y. Do not resize a node unless the user explicitly asked to resize it.
 - Default to SILENCE between tool calls. Emit at most one short terse line per action. No narration, no
   preamble, no recap. When the step's goal is met, stop calling tools.`;
 
@@ -80,6 +108,13 @@ const PLAN_TOOL: Anthropic.Tool = {
     "the tools do automatically (default positioning, even spacing inside applyAutoLayout). Aligning OR " +
     "distributing a set of existing children is usually ONE step. Re-styling a selected set to match one of " +
     "them is ONE step. A typical request is 1-3 steps, not 4-5.\n" +
+    "- For broad generative prompts like 'design an app screen', 'make a landing page', or 'create a dashboard', " +
+    "plan for a finished composition: structure, representative content, style/hierarchy, and final layout. " +
+    "It is valid for one step to create multiple children and style them together, but do not verify only an " +
+    "empty container.\n" +
+    "- If the prompt names a style, platform, or theme, ensure at least one step makes that visual direction " +
+    "observable through properties such as fills, corner radius, typography, spacing, and layout. If no style is " +
+    "named, pick a coherent direction that fits the product category instead of a generic default.\n" +
     "ALWAYS emit at least one step — NEVER return an empty plan. Every request below maps to tool calls; " +
     "if the goal is align/distribute/restyle of EXISTING nodes, you CAN still write a checkable criterion:\n" +
     "- 'arrange/line up/row/column the children of frame F' -> ONE step calling applyAutoLayout on F; verify " +
@@ -109,7 +144,9 @@ const PLAN_TOOL: Anthropic.Tool = {
               description:
                 "A machine-checkable post-condition. Pick ONE kind. " +
                 "nodeExists: a child of `parentId` with `type` (and optional `nameLike` substring) exists. " +
-                "childCount: existing `frameId` has exactly `count` direct children. " +
+                "childCount: existing `frameId` has AT LEAST `count` direct children (count is a " +
+                "minimum — pick the smallest number that proves the frame is populated, e.g. 2-3 for " +
+                "'a row of cards'; the act model decides the exact number). " +
                 "childCountNamed: like childCount but the frame is RESOLVED BY `parentId`+`type`+`nameLike` — " +
                 "use this to assert the child count of a frame THIS plan creates. " +
                 "prop: live `id`.`path` deep-equals `equals` (e.g. path 'layout.mode' equals 'VERTICAL') — " +
@@ -149,7 +186,7 @@ const PLAN_TOOL: Anthropic.Tool = {
                   description: "nodeExists: optional case-insensitive name substring.",
                 },
                 frameId: { type: "string", description: "childCount: frame NodeId." },
-                count: { type: "number", description: "childCount: expected child count." },
+                count: { type: "number", description: "childCount: MINIMUM child count (>=); pick a small lower bound." },
                 id: { type: "string", description: "prop/belowOf: target NodeId." },
                 path: {
                   type: "string",
@@ -213,7 +250,20 @@ export async function plan(
     `Decompose this into an ordered plan. Each step MUST carry a success criterion that asserts the ` +
     `resulting node state (so it can be verified independently of the tools you call). ` +
     `Only the NodeIds listed above exist right now; any node your plan creates has NO id yet, so verify ` +
-    `created nodes with nodeExists/childCount, and use prop/belowOf only on the existing ids above.`;
+    `created nodes with nodeExists/childCount, and use prop/belowOf only on the existing ids above.\n\n` +
+    `For broad design-generation intents, plan a complete composition rather than a skeleton: include ` +
+    `representative content, visual hierarchy, style treatment, and final layout. If the user names a ` +
+    `style/theme/platform, make that direction visible through node properties such as fills, corner radius, ` +
+    `typography, spacing, and layout. If no style is named, pick one coherent visual direction that fits the ` +
+    `product category.\n\n` +
+    `If the intent names an element that should CONTAIN content — a labeled button, a card with a ` +
+    `title/price/button, a row with a checkbox and a label, a stat card with a number and a caption, ` +
+    `an hourly forecast card with time/condition/temperature, or a daily forecast row with ` +
+    `day/condition/high-low — plan ` +
+    `the step(s) that CREATE that inner content and verify the CONTENT (e.g. nodeExists TEXT by nameLike, or ` +
+    `childCountNamed on the container), NOT just the container: a frame with no children renders blank. ` +
+    `(A request that only aligns, distributes, restyles, or moves EXISTING nodes creates no new content — ` +
+    `plan it as the usual single step; never return an empty plan for it.)`;
 
   // Two attempts: an empty plan is almost always a model slip (esp. on align/distribute
   // of EXISTING nodes), not a genuine "nothing to do" — so retry once with a hard nudge
@@ -244,16 +294,31 @@ export async function plan(
     if (!block || block.type !== "tool_use")
       throw new Error("Planner did not emit a plan tool-call.");
 
-    const raw = block.input as { steps?: unknown };
-    const rawSteps = Array.isArray(raw.steps) ? raw.steps : [];
-    const steps = rawSteps.map((s: any, i: number): Step => ({
-      index: typeof s.index === "number" ? s.index : i,
-      label: String(s.label ?? `Step ${i + 1}`),
-      criterion: s.criterion as SuccessCriterion,
-    }));
+    const steps = coercePlanSteps(block.input);
     if (steps.length > 0) return steps;
   }
   return []; // still empty after the nudge — the loop reports it honestly
+}
+
+/** Parse the emit_plan tool input into Step[], tolerant of a malformed shape.
+ *  The model intermittently emits `steps` as a mangled string (leaking tool-call
+ *  markup) and hoists the lone step's label/criterion to the top level. A naive
+ *  `Array.isArray(steps)` check silently dropped that into an EMPTY plan — a false
+ *  "can't make that edit" for valid single-step requests (recolor/align/restyle).
+ *  When `steps` isn't a usable array but a top-level `criterion` is present, treat
+ *  the whole input AS that one step. Exported for the recovery smoke test. */
+export function coercePlanSteps(input: unknown): Step[] {
+  const raw = (input ?? {}) as { steps?: unknown; label?: unknown; criterion?: unknown; index?: unknown };
+  const rawSteps = Array.isArray(raw.steps)
+    ? raw.steps
+    : raw.criterion && typeof raw.criterion === "object"
+      ? [{ index: raw.index, label: raw.label, criterion: raw.criterion }]
+      : [];
+  return rawSteps.map((s: any, i: number): Step => ({
+    index: typeof s.index === "number" ? s.index : i,
+    label: String(s.label ?? `Step ${i + 1}`),
+    criterion: s.criterion as SuccessCriterion,
+  }));
 }
 
 // ---- act: one NON-streaming tool-use turn (streaming is Day 6) ----
@@ -266,6 +331,11 @@ export interface ActContext {
   markMap: Record<string, NodeId>;
   version: number;
   step: Step;
+  /** The human's resolved selection, if any. The act model MUST act on EVERY id in
+   *  this set for a bulk request ("delete each", "recolor all") — without it, a step
+   *  labeled "delete the selected titles" is ambiguous and the model touches only one
+   *  node, completing partially while verify (a single post-condition) still passes. */
+  selection?: NodeId[];
 }
 
 export interface ActResult {
@@ -292,6 +362,11 @@ export function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
     type: "text",
     text:
       `Current step [${ctx.step.index}]: ${ctx.step.label}\n\n` +
+      (ctx.selection && ctx.selection.length
+        ? `The human selected these NodeIds — they are your targets for THIS step. If the step ` +
+          `acts on "the selected"/"each"/"every"/"all" of them, apply the change to EVERY id ` +
+          `listed (one tool call per node); do not stop after the first: ${ctx.selection.join(", ")}\n\n`
+        : "") +
       `Scene graph (scoped, v${ctx.version}):\n${JSON.stringify(ctx.tree, null, 2)}\n\n` +
       `markMap (number -> NodeId): ${JSON.stringify(ctx.markMap)}`,
   });

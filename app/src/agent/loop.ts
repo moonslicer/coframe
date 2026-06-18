@@ -15,14 +15,21 @@ import { isErr } from "../shared/types.js";
 import { dispatch, REGISTRY } from "../shared/tools.js";
 import { getTree, fieldsFor, render } from "../render/perception.js";
 import type { TaskHint } from "../render/perception.js";
-import { verifyStructural } from "./verify.js";
+import { verifyContentCompleteness, verifyStructural } from "./verify.js";
 import type { RunController } from "./run-controller.js";
 import { perceptionBlocks } from "./llm-adapter.js";
 import type { ContentBlockParam, ActDelta } from "./llm-adapter.js";
 import type { Step } from "./types.js";
 
-const MAX_TURNS = 12; // hard ceiling so a run can't blow its token budget
 const MAX_ATTEMPTS = 3; // bounded retry per failing step
+// Hard ceiling on total model turns so a run can't blow its token budget. A flat 12
+// starved thorough multi-element plans (a 6-step login form needs ~1-2 turns/step plus
+// retries) — escalating them half-built. Scale with plan length, floored at 12 and
+// capped so a runaway plan still can't spin forever.
+const MAX_TURNS_PER_STEP = 4;
+const MAX_TURNS_CAP = 40;
+const turnBudgetFor = (planLength: number) =>
+  Math.min(MAX_TURNS_CAP, Math.max(12, planLength * MAX_TURNS_PER_STEP));
 
 /** Resolve the working frame: the selection's common parent, else the page root. */
 function resolveRoot(store: DocStore, selection: NodeId[]): NodeId {
@@ -114,13 +121,22 @@ export async function runTask(
   rc.emitPlan(plan);
 
   let turns = 0;
+  const maxTurns = turnBudgetFor(plan.length);
+  const originalIds = new Set(rc.snapshot.nodes.keys());
+
+  // Steps whose criterion never verified after MAX_ATTEMPTS. A single such step must
+  // NOT sink the whole run: a multi-section design (a weather/instagram/settings
+  // screen) builds 4-6 sections, and one section's strict criterion mis-firing (or a
+  // genuinely-missed sub-step) shouldn't report "couldn't complete" over an otherwise
+  // finished screen. We keep going, and decide done-vs-escalated from the WHOLE plan.
+  const failedSteps: string[] = [];
 
   for (const step of plan) {
     rc.setStep(step);
     let verified = false;
 
     while (rc.attempts < MAX_ATTEMPTS) {
-      if (++turns > MAX_TURNS) {
+      if (++turns > maxTurns) {
         store.restore(rc.snapshot);
         return rc.finishEscalated("Hit the turn budget; restored pre-run state.");
       }
@@ -168,7 +184,7 @@ export async function runTask(
       // Persist the per-turn perception as a user turn BEFORE act, so the request
       // ALWAYS starts with a user turn (otherwise call #2+ would begin with the prior
       // assistant tool_use turn -> Anthropic 400 "first message must be user").
-      rc.pushUser(perceptionBlocks({ tree, image, markMap: r.markMap, version: r.version, step }));
+      rc.pushUser(perceptionBlocks({ tree, image, markMap: r.markMap, version: r.version, step, selection: rc.selection }));
       const turn = await act(rc.messages, onDelta);
       if (turn.stopReason === "refusal") {
         store.restore(rc.snapshot);
@@ -219,7 +235,10 @@ export async function runTask(
 
       if (turn.toolUses.length === 0) {
         // Model emitted no tool calls — let VERIFY decide if the step is satisfied.
-        const v = verifyStructural(step.criterion, store);
+        const structural = verifyStructural(step.criterion, store);
+        const v = structural.ok
+          ? verifyContentCompleteness({ intent, step, store, rootId, originalIds })
+          : structural;
         if (v.ok) {
           verified = true;
           break;
@@ -237,7 +256,10 @@ export async function runTask(
 
       // VERIFY: tier-1 structural read-back (no model call, <5ms)
       rc.transition("VERIFYING");
-      const v = verifyStructural(step.criterion, store);
+      const structural = verifyStructural(step.criterion, store);
+      const v = structural.ok
+        ? verifyContentCompleteness({ intent, step, store, rootId, originalIds })
+        : structural;
       const reflection = `Verify: ${v.evidence}`;
 
       // Push tool results (+ verify reflection on failure) as the next user turn.
@@ -257,10 +279,28 @@ export async function runTask(
     }
 
     if (!verified) {
-      store.restore(rc.snapshot); // §5.1: clean one-undo guarantee on persistent failure
-      return rc.finishEscalated(`Couldn't complete: ${step.label}`);
+      // KEEP every committed step (including this step's partial ops) and CONTINUE to
+      // the next step. Discarding a whole run on a single verify miss is the "built the
+      // design, then showed an empty canvas" bug — and a too-strict criterion can
+      // mis-reject a step whose work was actually correct. The one-undo guarantee is the
+      // SERVER's pre-run snapshot (restored on `undo`), not a loop-internal rollback; the
+      // run-end doc-sync mirrors whatever we keep here, so a single Cmd-Z still clears it.
+      failedSteps.push(step.label);
     }
   }
 
-  rc.finishDone(summary(plan));
+  // Decide the run's terminal status from the WHOLE plan, not the first miss:
+  // - every step verified            -> clean done
+  // - some verified, some did not     -> done WITH a caveat naming the unconfirmed steps
+  //   (the screen is mostly built; reporting a hard failure over it is the worse lie)
+  // - NOTHING verified                -> honest escalation (the run truly accomplished nothing)
+  if (failedSteps.length === 0) {
+    rc.finishDone(summary(plan));
+  } else if (failedSteps.length < plan.length) {
+    rc.finishDone(
+      `${summary(plan)} — couldn't fully verify ${failedSteps.length} of ${plan.length} step(s): ${failedSteps.join("; ")}`,
+    );
+  } else {
+    rc.finishEscalated(`Couldn't complete: ${failedSteps[0]}.`);
+  }
 }
