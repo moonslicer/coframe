@@ -10,6 +10,13 @@ Status: v1 draft, 2026-06-16. Author is the final integrator; this supersedes sc
 `agentic-canvas-design.md`, `perception-spec.md`, and `tool-vocabulary-spec.md` where they conflict
 (conflicts are called out inline).
 
+> **Since-build addendum (2026-06-17):** the user-editable-canvas feature shipped after this
+> snapshot. Two statements below are now stale: the browser is **no longer a read-only mirror** —
+> it mutates the authoritative doc directly via a `{t:"tool"}` client→server message (through the
+> same `dispatch → commit` pipeline), and the tool registry grew from **8 to 14** tools. The
+> "human edits are hard-disabled during a run" invariant still holds. See the
+> "Feature: user-editable canvas" entry in `BUILD_PROGRESS.md` for the current state.
+
 ---
 
 ## 1. Objective & the demo script (the success criterion)
