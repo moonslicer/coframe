@@ -30,6 +30,8 @@ store.loadSeed(getSeed(activeSeedId).seed);
 type Snapshot = ReturnType<DocStore["snapshot"]>;
 let lastSnapshot: Snapshot | null = null;
 let lastRunVersion = 0; // doc version AT the time the run started (for undo bookkeeping)
+// Pending human edits since the last run/undo should coalesce into the next run's undo level.
+let humanDirty = false;
 
 // The run guard: while a run is active, human mutations are rejected (single writer).
 let activeRC: RunController | null = null;
@@ -103,6 +105,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
       activeSeedId = id;
       store.loadSeed(seed);
       lastSnapshot = null;
+      humanDirty = false;
       send(ws, docSync("doc-sync"));
       return;
     }
@@ -118,6 +121,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
       }
       store.restore(lastSnapshot);
       lastSnapshot = null; // one undo level only — no redo, no ring
+      humanDirty = false;
       send(ws, docSync("undone"));
       return;
     }
@@ -133,6 +137,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         lastSnapshot = store.snapshot();
         lastRunVersion = store.version;
       }
+      humanDirty = true; // a human edit is now pending
       // args are untrusted `unknown` — dispatch may throw on malformed input.
       let r;
       try {
@@ -157,7 +162,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
       }
       // Capture the pre-run snapshot on the server so undo can restore it. Guarded
       // so a human edit followed by a run coalesces into one undo level.
-      if (!lastSnapshot) {
+      if (!lastSnapshot || !humanDirty) {
         lastSnapshot = store.snapshot();
         lastRunVersion = store.version;
       }
@@ -173,6 +178,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         rc.finishEscalated(`Run threw: ${(err as Error).message}`);
       } finally {
         activeRC = null;
+        humanDirty = false; // the run is committed; the next run is its own level
         // Push a definitive doc-sync so the mirror matches the authoritative store
         // exactly (covers any op the mirror missed mid-stream).
         send(ws, docSync("doc-sync"));

@@ -412,6 +412,45 @@ register({
 });
 
 register({
+  name: "setBBoxes",
+  schema: {
+    name: "setBBoxes",
+    description:
+      "Set absolute bbox for MULTIPLE nodes in one atomic commit — use for multi-node drag-move so all " +
+      "nodes move under one version. Each item is { id, bbox:[x,y,w,h] } in canvas coords.",
+    input_schema: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          description: "Nodes to move, each as { id, bbox } where bbox is [x,y,w,h].",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "NodeId to move/resize." },
+              bbox: {
+                type: "array",
+                items: { type: "number" },
+                description: "[x,y,w,h] in canvas coords — the new absolute rectangle.",
+              },
+            },
+            required: ["id", "bbox"],
+          },
+        },
+      },
+      required: ["items"],
+    },
+  },
+  validate: (a, s) => {
+    for (const it of a.items) if (!s.has(it.id)) return badId(it.id);
+    return null;
+  },
+  plan: (a) =>
+    a.items.map((it: { id: NodeId; bbox: BBox }) => ({ kind: "set", id: it.id, path: "bbox", value: it.bbox })),
+  label: (a) => `setBBoxes ${a.items.length} node(s)`,
+});
+
+register({
   name: "deleteNodes",
   schema: {
     name: "deleteNodes",
@@ -459,6 +498,10 @@ register({
     if (!s.has(a.id)) return badId(a.id);
     if (!s.has(a.parent)) return badId(a.parent);
     if (a.parent === a.id) return { error: "CONSTRAINT", detail: "cannot reparent a node into itself" };
+    // Reparenting into the CURRENT parent would compute an off-by-one default index
+    // (store removes then splices), so reject it as a no-op.
+    if (a.parent === s.getNode(a.id)!.parent)
+      return { error: "CONSTRAINT", detail: `${a.id} is already a child of ${a.parent}` };
     // cycle guard: reparenting into a descendant of id would corrupt the tree.
     if (isDescendant(s, a.id, a.parent))
       return { error: "CONSTRAINT", detail: `${a.parent} is a descendant of ${a.id}` };

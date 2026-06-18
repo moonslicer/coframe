@@ -30,6 +30,13 @@ function route(msg: ServerMessage) {
     case "ops-applied":
       docMirror.applyOps(msg.ops, msg.version);
       break;
+    case "rejected":
+      // A rejected human edit left an optimistic preview diverged from the server.
+      // Re-anchor to authoritative truth (mirrors the reparent timeout→resync path),
+      // then still surface the banner via runStore.apply.
+      sendWhenOpen({ t: "resync" });
+      runStore.apply(msg);
+      break;
     default:
       runStore.apply(msg);
   }

@@ -71,6 +71,33 @@ async function main() {
   check("3 createShape add op carries server-minted node:* id", newId.startsWith("node:"), `id=${newId}`);
   version = r3.version;
 
+  // ---- 3b. setBBoxes: TWO real nodes move atomically under ONE version ----
+  // Proves multi-node drag commits in a single bump (vs N STALE-prone setBBox calls).
+  const a = target.id;
+  const b = newId;
+  const aBox: [number, number, number, number] = [bx + 20, by + 20, bw, bh];
+  const bBox: [number, number, number, number] = [99, 88, 60, 40];
+  send({
+    t: "tool",
+    name: "setBBoxes",
+    args: { items: [{ id: a, bbox: aBox }, { id: b, bbox: bBox }] },
+    baseVersion: version,
+  });
+  const r3b = await waitFor(received, (m) => m.t === "ops-applied" && m.version > version);
+  if (r3b.t !== "ops-applied") throw new Error("expected ops-applied");
+  check("3b setBBoxes bumps version by exactly 1", r3b.version === version + 1, `${version} -> ${r3b.version}`);
+  const setA = r3b.ops.find((o: Op) => o.kind === "set" && o.id === a && o.path === "bbox");
+  const setB = r3b.ops.find((o: Op) => o.kind === "set" && o.id === b && o.path === "bbox");
+  check(
+    "3b setBBoxes set op for node A",
+    !!setA && JSON.stringify((setA as any).value) === JSON.stringify(aBox),
+  );
+  check(
+    "3b setBBoxes set op for node B",
+    !!setB && JSON.stringify((setB as any).value) === JSON.stringify(bBox),
+  );
+  version = r3b.version;
+
   // ---- 4. bad id -> rejected containing BAD_ID ----
   send({ t: "tool", name: "setBBox", args: { id: "node:nope", bbox: [0, 0, 1, 1] }, baseVersion: version });
   const r4 = await waitFor(received, (m) => m.t === "rejected");

@@ -406,19 +406,21 @@ export function Canvas() {
     const target = g.kind === "move" ? g.reparentTarget : null;
     setReparentTarget(null);
 
-    // A real drag committed: send one setBBox per affected node (setBBox is single-id).
-    // The server's ops-applied echo snaps the mirror back to authoritative truth.
+    // A real drag committed: send ONE setBBoxes for all affected nodes so they move
+    // under a single version (N separate setBBox calls share one baseVersion and all
+    // but the first would be STALE). The server's ops-applied echo snaps the mirror
+    // back to authoritative truth.
     const bboxes: { id: NodeId; bbox: BBox }[] = [];
     for (const [id] of g.orig) {
       const n = docMirror.store.getNode(id);
       if (n) bboxes.push({ id, bbox: n.bbox as BBox });
     }
-    for (const b of bboxes) sendTool("setBBox", b);
+    if (bboxes.length) sendTool("setBBoxes", { items: bboxes });
 
     // Drag-to-reparent: a single node dropped into a valid new frame. We must send
-    // setBBox FIRST (above), then reparent — but reparent's baseVersion would be
+    // setBBoxes FIRST (above), then reparent — but reparent's baseVersion would be
     // STALE if we fired it immediately, because sendTool reads docMirror.version,
-    // which only advances when the server echoes the setBBox. So we AWAIT the echo
+    // which only advances when the server echoes the setBBoxes. So we AWAIT the echo
     // (docMirror.nextOpsApplied) before sending reparent, racing it against a timeout
     // so a missing echo can't hang the gesture — on timeout we skip and resync.
     if (target && bboxes.length === 1) {
