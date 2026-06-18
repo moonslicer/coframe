@@ -17,6 +17,7 @@
     "smoke:loop": "tsx src/agent/run.test-smoke.ts",
     "smoke:eval": "tsx src/agent/eval.test-smoke.ts",
     "smoke:plan-coerce": "tsx src/agent/plan-coerce.test-smoke.ts",
+    "smoke:verify-repro": "tsx src/agent/verify-repro.test-smoke.ts",
     "smoke:tokens": "tsx src/agent/count-tokens.test-smoke.ts",
     "smoke:server": "tsx src/server/server.test-smoke.ts",
     "smoke:tool": "tsx src/server/tool.test-smoke.ts",

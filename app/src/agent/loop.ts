@@ -1,8 +1,12 @@
 // The §5.4 agent loop, EXACTLY: snapshot BEFORE any mutation -> plan -> for each
 // step: PERCEIVE (fresh scoped getTree + marked render) -> ACT (one model turn,
 // dispatch tool_uses through store.commit) -> VERIFY (verifyStructural against the
-// step's criterion) -> bounded retry (feed evidence back) -> on persistent failure
-// finishEscalated AND restore the pre-run snapshot (clean one-undo guarantee).
+// step's criterion) -> bounded retry (feed evidence back). A step that never verifies
+// is KEPT (its committed ops stay) and the run continues; the run finishes done (with a
+// caveat if some steps were unconfirmed) and only escalates when NOTHING verified. The
+// loop does NOT restore on failure — the clean one-undo guarantee is the SERVER's
+// pre-run snapshot (pushed before runTask, restored on `undo`), not a loop-internal
+// rollback (see the keep-partial-work note at the end of runTask).
 //
 // A MANUAL tool-use loop: every tool result passes boundary validation + structural
 // verify before going back to the model, with snapshot + log emission in between —
