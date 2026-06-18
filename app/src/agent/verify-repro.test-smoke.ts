@@ -162,5 +162,51 @@ console.log(
 );
 console.log(`        evidence: ${sectionContent.evidence}\n`);
 
+// Generalization guard: a design system OUTSIDE the old demo domains (no
+// forecast/card/pricing/dashboard keyword anywhere) must STILL get content enforced.
+// Pre-fix, the domain-keyword gate skipped completeness entirely for these, so blank
+// shells shipped as "done". Here a Nintendo-style retro arcade screen builds two
+// novel-named sections — one filled, one blank — and only the blank one must fail.
+const arcadeStore = new DocStore();
+arcadeStore.loadSeed({
+  rootId: "page",
+  nodes: [
+    { id: "page", type: "FRAME", name: "Page", parent: null, children: [],
+      bbox: [0, 0, 1440, 1024], style: { fills: [] }, layout: { mode: "NONE" } } as unknown as Node,
+  ],
+});
+const av = () => arcadeStore.version;
+const aid = (r: any) => r.ops[0].node?.id ?? r.ops[0].id;
+// page > Arcade Screen (a shell — must NOT be flagged) > two sections.
+const arcadeScreen = aid(dispatch("createFrame", { parent: "page", name: "Arcade Screen" }, arcadeStore, av()));
+// A FILLED "Cartridge Slot" — holds a label + a shape, so it passes.
+const slot = aid(dispatch("createFrame", { parent: arcadeScreen, name: "Cartridge Slot" }, arcadeStore, av()));
+dispatch("createText", { parent: slot, chars: "INSERT COIN" }, arcadeStore, av());
+dispatch("createShape", { parent: slot, kind: "RECT" }, arcadeStore, av());
+// A BLANK "High Score Marquee" — no children, must be flagged even with zero demo keywords.
+dispatch("createFrame", { parent: arcadeScreen, name: "High Score Marquee" }, arcadeStore, av());
+const arcadeStep: Step = {
+  index: 0,
+  label: "Lay out the arcade home screen sections",
+  criterion: { kind: "nodeExists", parentId: "page", type: "FRAME", nameLike: "marquee" },
+};
+const arcadeContent = verifyContentCompleteness({
+  intent: "design a retro arcade home screen in the style of Nintendo",
+  step: arcadeStep,
+  store: arcadeStore,
+  rootId: "page",
+  originalIds: new Set(["page"]),
+});
+const arcadePass =
+  arcadeContent.ok === false &&
+  arcadeContent.evidence.includes("High Score Marquee") &&
+  !arcadeContent.evidence.includes("Cartridge Slot") &&
+  !arcadeContent.evidence.includes("Arcade Screen");
+allOk = allOk && arcadePass;
+console.log(
+  `${arcadePass ? "EXPECTED ✓" : "REGRESSION ✗"}  [content ${arcadeContent.ok ? "PASS" : "FAIL"}]  Non-demo domain (Nintendo arcade): blank novel-named section must fail; filled section + screen shell must not`,
+);
+console.log(`        evidence: ${arcadeContent.evidence}\n`);
+
 console.log(allOk ? "ALL EXPECTATIONS MET ✓" : "SOME EXPECTATIONS FAILED ✗");
 process.exit(allOk ? 0 : 1);

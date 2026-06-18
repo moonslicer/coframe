@@ -3,3 +3,4 @@ dist
 *.local
 .env
 tmp
+dev.log

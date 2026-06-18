@@ -15,6 +15,7 @@ import type { ServerEvent as RunEvent } from "../agent/run-controller.js";
 export type ClientMessage =
   | { t: "prompt"; text: string; selection: NodeId[]; seedDocId?: string }
   | { t: "undo" }
+  | { t: "redo" }
   | { t: "select"; ids: NodeId[] }
   | { t: "loadSeed"; seedDocId: string }
   | { t: "resync" }
@@ -36,13 +37,31 @@ export interface UndoneMessage {
   version: DocVersion;
   seedDocId: string;
 }
+export interface RedoneMessage {
+  t: "redone";
+  nodes: Node[];
+  rootId: NodeId;
+  version: DocVersion;
+  seedDocId: string;
+}
+export interface HistoryStateMessage {
+  t: "history-state";
+  canUndo: boolean;
+  canRedo: boolean;
+}
 // Surfaced when the single-writer guard rejects a human mutation mid-run.
 export interface RejectedMessage {
   t: "rejected";
   reason: string;
 }
 
-export type ServerMessage = RunEvent | DocSyncMessage | UndoneMessage | RejectedMessage;
+export type ServerMessage =
+  | RunEvent
+  | DocSyncMessage
+  | UndoneMessage
+  | RedoneMessage
+  | HistoryStateMessage
+  | RejectedMessage;
 
 // Re-export the run-event union so the client imports run-event types from one place.
 export type { RunEvent };

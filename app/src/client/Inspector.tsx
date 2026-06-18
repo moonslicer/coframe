@@ -14,9 +14,11 @@ import { sendTool } from "./ws.js";
 import type { Node, NodeId } from "../shared/types.js";
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+type InspectorTier = "simple" | "pro" | "code";
 
 export function Inspector() {
   useDocVersion(); // re-render on selection AND doc (version) changes
+  const [tier, setTier] = useState<InspectorTier>("simple");
   const run = useRunState();
   const runActive =
     run.phase !== "IDLE" && run.phase !== "DONE" && run.phase !== "ESCALATED";
@@ -47,9 +49,16 @@ export function Inspector() {
     return (
       <div>
         <div style={header}>{nodes.length} selected</div>
+        <TierTabs tier={tier} setTier={setTier} />
         <div key={groupKey}>
-          <FillField node={first} ids={ids} disabled={runActive} />
-          {allText && <TypographyFields node={first} ids={ids} disabled={runActive} />}
+          {tier === "code" ? (
+            <div style={hint}>Code editing is available for a single selected node.</div>
+          ) : (
+            <>
+              <FillField node={first} ids={ids} disabled={runActive} />
+              {allText && <TypographyFields node={first} ids={ids} disabled={runActive} />}
+            </>
+          )}
         </div>
       </div>
     );
@@ -66,16 +75,63 @@ export function Inspector() {
         {node.name}
         <span style={{ color: "#9ca3af", fontWeight: 400 }}> · {node.type}</span>
       </div>
+      <TierTabs tier={tier} setTier={setTier} />
       <div key={fieldKey}>
-        <GeometryFields node={node} disabled={runActive} />
-        <FillField node={node} ids={[node.id]} disabled={runActive} />
-        {isText && (
+        {tier === "code" ? (
+          <CodeFields node={node} disabled={runActive} />
+        ) : (
           <>
-            <TextCharsField node={node} disabled={runActive} />
-            <TypographyFields node={node} ids={[node.id]} disabled={runActive} />
+            <GeometryFields node={node} disabled={runActive} />
+            <FillField node={node} ids={[node.id]} disabled={runActive} />
+            {isText && (
+              <>
+                <TextCharsField node={node} disabled={runActive} />
+                <TypographyFields node={node} ids={[node.id]} disabled={runActive} />
+              </>
+            )}
+            {tier === "pro" && (
+              <>
+                <StrokeField node={node} disabled={runActive} />
+                <AppearanceFields node={node} disabled={runActive} />
+                <LayoutFields node={node} disabled={runActive} />
+                {node.type === "VECTOR" && <VectorFields node={node} disabled={runActive} />}
+                <DebugFields node={node} />
+              </>
+            )}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function TierTabs({
+  tier,
+  setTier,
+}: {
+  tier: InspectorTier;
+  setTier: (tier: InspectorTier) => void;
+}) {
+  const tiers: InspectorTier[] = ["simple", "pro", "code"];
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 10 }}>
+      {tiers.map((t) => {
+        const active = tier === t;
+        return (
+          <button
+            key={t}
+            onClick={() => setTier(t)}
+            style={{
+              ...tabButton,
+              background: active ? "var(--text)" : "#fff",
+              color: active ? "#fff" : "var(--muted)",
+              borderColor: active ? "var(--text)" : "var(--border)",
+            }}
+          >
+            {t[0].toUpperCase() + t.slice(1)}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -118,13 +174,17 @@ function FillField({
   ids: NodeId[];
   disabled: boolean;
 }) {
-  const current = node.style?.fills?.[0]?.color ?? "#000000";
+  const current = node.type === "VECTOR" ? node.vector?.fill ?? "#000000" : node.style?.fills?.[0]?.color ?? "#000000";
   const [draft, setDraft] = useState(current);
 
   const commit = (val: string) => {
     if (!HEX_RE.test(val)) return; // ignore invalid hex
     if (val.toLowerCase() === current.toLowerCase()) return;
-    sendTool("setFill", { ids, color: val });
+    if (node.type === "VECTOR" && ids.length === 1) {
+      sendTool("setProps", { id: node.id, patch: { "vector.fill": val } });
+    } else {
+      sendTool("setFill", { ids, color: val });
+    }
   };
 
   return (
@@ -233,7 +293,7 @@ function TypographyFields({
           value={align}
           disabled={disabled}
           onChange={(e) => {
-            const v = e.target.value as "LEFT" | "CENTER" | "RIGHT";
+            const v = e.target.value as "LEFT" | "CENTER" | "RIGHT" | "JUSTIFY";
             if (v !== align) sendTool("setTextStyle", { ids, align: v });
           }}
           style={{ ...input, width: "100%", cursor: disabled ? "default" : "pointer" }}
@@ -241,10 +301,375 @@ function TypographyFields({
           <option value="LEFT">Left</option>
           <option value="CENTER">Center</option>
           <option value="RIGHT">Right</option>
+          <option value="JUSTIFY">Justify</option>
         </select>
       </Row>
     </>
   );
+}
+
+function StrokeField({ node, disabled }: { node: Node; disabled: boolean }) {
+  const isVector = node.type === "VECTOR";
+  const currentColor = isVector ? node.vector?.stroke ?? "#8A8378" : node.style?.stroke?.color ?? "#000000";
+  const currentWidth = isVector ? node.vector?.strokeWidth ?? 4 : node.style?.stroke?.weight ?? 1;
+  const currentStyle = node.style?.stroke?.style ?? "solid";
+  const [colorDraft, setColorDraft] = useState(currentColor);
+
+  const commitColor = (val: string) => {
+    if (!HEX_RE.test(val) || val.toLowerCase() === currentColor.toLowerCase()) return;
+    if (isVector) sendTool("setProps", { id: node.id, patch: { "vector.stroke": val } });
+    else
+      sendTool("setProps", {
+        id: node.id,
+        patch: { "style.stroke": { ...(node.style?.stroke ?? {}), color: val, weight: currentWidth, style: currentStyle } },
+      });
+  };
+  const commitWidth = (raw: string) => {
+    const v = Number(raw);
+    if (raw.trim() === "" || Number.isNaN(v) || v === currentWidth) return;
+    if (isVector) sendTool("setProps", { id: node.id, patch: { "vector.strokeWidth": v } });
+    else
+      sendTool("setProps", {
+        id: node.id,
+        patch: { "style.stroke": { ...(node.style?.stroke ?? {}), color: currentColor, weight: v, style: currentStyle } },
+      });
+  };
+
+  return (
+    <Row label={isVector ? "Stroke" : "Border"}>
+      <div style={{ display: "grid", gridTemplateColumns: "28px 1fr 72px", gap: 6 }}>
+        <input
+          type="color"
+          value={HEX_RE.test(colorDraft) ? colorDraft : "#000000"}
+          disabled={disabled}
+          onChange={(e) => {
+            setColorDraft(e.target.value);
+            commitColor(e.target.value);
+          }}
+          style={{ width: 28, height: 28, padding: 0, border: "1px solid #d1d5db", borderRadius: 6 }}
+        />
+        <input
+          type="text"
+          value={colorDraft}
+          disabled={disabled}
+          onChange={(e) => setColorDraft(e.target.value)}
+          onBlur={(e) => commitColor(e.target.value)}
+          style={{ ...input, minWidth: 0 }}
+        />
+        <NumField label="W" initial={currentWidth} disabled={disabled} onCommit={commitWidth} />
+      </div>
+      {!isVector && (
+        <select
+          value={currentStyle}
+          disabled={disabled}
+          onChange={(e) =>
+            sendTool("setProps", {
+              id: node.id,
+              patch: {
+                "style.stroke": {
+                  ...(node.style?.stroke ?? {}),
+                  color: currentColor,
+                  weight: currentWidth,
+                  style: e.target.value,
+                },
+              },
+            })
+          }
+          style={{ ...input, width: "100%", marginTop: 6 }}
+        >
+          <option value="none">None</option>
+          <option value="solid">Solid</option>
+          <option value="dashed">Dashed</option>
+          <option value="dotted">Dotted</option>
+          <option value="double">Double</option>
+        </select>
+      )}
+    </Row>
+  );
+}
+
+function AppearanceFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const radius = node.style?.cornerRadius ?? 0;
+  const opacityValue = node.style?.opacity ?? 1;
+  const overflow = node.style?.overflow ?? "visible";
+  return (
+    <Row label="Appearance">
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+        <NumField
+          label="R"
+          initial={radius}
+          disabled={disabled}
+          onCommit={(raw) => {
+            const v = Number(raw);
+            if (raw.trim() !== "" && !Number.isNaN(v) && v !== radius)
+              sendTool("setProps", { id: node.id, patch: { "style.cornerRadius": v } });
+          }}
+        />
+        <NumField
+          label="O"
+          initial={opacityValue}
+          disabled={disabled}
+          onCommit={(raw) => {
+            const v = Number(raw);
+            if (raw.trim() !== "" && !Number.isNaN(v) && v !== opacityValue)
+              sendTool("setProps", { id: node.id, patch: { "style.opacity": Math.max(0, Math.min(1, v)) } });
+          }}
+        />
+      </div>
+      <select
+        value={overflow}
+        disabled={disabled}
+        onChange={(e) => sendTool("setProps", { id: node.id, patch: { "style.overflow": e.target.value } })}
+        style={{ ...input, width: "100%" }}
+      >
+        <option value="visible">Visible</option>
+        <option value="hidden">Hidden</option>
+        <option value="auto">Auto</option>
+        <option value="scroll">Scroll</option>
+      </select>
+    </Row>
+  );
+}
+
+function LayoutFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const display = node.layout?.display ?? (node.type === "FRAME" ? "flex" : "block");
+  const mode = node.layout?.mode ?? "NONE";
+  const gap = node.layout?.gap ?? 0;
+  const padding = node.layout?.padding ?? 0;
+  return (
+    <>
+      <Row label="Contents Layout">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+          <select
+            value={display}
+            disabled={disabled}
+            onChange={(e) => sendTool("setProps", { id: node.id, patch: { "layout.display": e.target.value } })}
+            style={{ ...input, width: "100%" }}
+          >
+            <option value="block">Block</option>
+            <option value="flex">Flex</option>
+            <option value="grid">Grid</option>
+            <option value="inline-block">Inline-block</option>
+            <option value="inline">Inline</option>
+            <option value="none">None</option>
+          </select>
+          <select
+            value={mode}
+            disabled={disabled}
+            onChange={(e) => sendTool("setProps", { id: node.id, patch: { "layout.mode": e.target.value } })}
+            style={{ ...input, width: "100%" }}
+          >
+            <option value="NONE">None</option>
+            <option value="HORIZONTAL">Row</option>
+            <option value="VERTICAL">Column</option>
+          </select>
+        </div>
+      </Row>
+      <Row label="Spacing">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+          <NumField
+            label="G"
+            initial={gap}
+            disabled={disabled}
+            onCommit={(raw) => {
+              const v = Number(raw);
+              if (raw.trim() !== "" && !Number.isNaN(v) && v !== gap)
+                sendTool("setProps", { id: node.id, patch: { "layout.gap": v } });
+            }}
+          />
+          <NumField
+            label="P"
+            initial={padding}
+            disabled={disabled}
+            onCommit={(raw) => {
+              const v = Number(raw);
+              if (raw.trim() !== "" && !Number.isNaN(v) && v !== padding)
+                sendTool("setProps", { id: node.id, patch: { "layout.padding": v } });
+            }}
+          />
+        </div>
+      </Row>
+    </>
+  );
+}
+
+function VectorFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const linecap = node.vector?.linecap ?? "round";
+  const linejoin = node.vector?.linejoin ?? "round";
+  const scaling = node.vector?.scaling ?? "stretch";
+  return (
+    <Row label="Vector">
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+        <select
+          value={linecap}
+          disabled={disabled}
+          onChange={(e) => sendTool("setProps", { id: node.id, patch: { "vector.linecap": e.target.value } })}
+          style={{ ...input, width: "100%" }}
+        >
+          <option value="butt">Butt</option>
+          <option value="round">Round</option>
+          <option value="square">Square</option>
+        </select>
+        <select
+          value={linejoin}
+          disabled={disabled}
+          onChange={(e) => sendTool("setProps", { id: node.id, patch: { "vector.linejoin": e.target.value } })}
+          style={{ ...input, width: "100%" }}
+        >
+          <option value="miter">Miter</option>
+          <option value="round">Round</option>
+          <option value="bevel">Bevel</option>
+        </select>
+      </div>
+      <select
+        value={scaling}
+        disabled={disabled}
+        onChange={(e) => sendTool("setProps", { id: node.id, patch: { "vector.scaling": e.target.value } })}
+        style={{ ...input, width: "100%" }}
+      >
+        <option value="stretch">Stretch</option>
+        <option value="aspect-fit">Aspect fit</option>
+        <option value="fill">Fill</option>
+      </select>
+    </Row>
+  );
+}
+
+function CodeFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const [draft, setDraft] = useState(nodeToDeclarations(node));
+  const commit = (raw: string) => {
+    const patch = parseDeclarations(node, raw);
+    if (Object.keys(patch).length) sendTool("setProps", { id: node.id, patch });
+  };
+  return (
+    <>
+      <Row label="Code">
+        <textarea
+          value={draft}
+          disabled={disabled}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={(e) => commit(e.target.value)}
+          spellCheck={false}
+          style={{ ...input, width: "100%", minHeight: 220, resize: "vertical", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", lineHeight: 1.45 }}
+        />
+      </Row>
+      <DebugFields node={node} />
+    </>
+  );
+}
+
+function DebugFields({ node }: { node: Node }) {
+  return (
+    <Row label="Debug">
+      <pre
+        style={{
+          margin: 0,
+          padding: 8,
+          borderRadius: 6,
+          background: "#f9fafb",
+          border: "1px solid #e5e7eb",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          fontSize: 11,
+        }}
+      >
+        {JSON.stringify(node, null, 2)}
+      </pre>
+    </Row>
+  );
+}
+
+function nodeToDeclarations(node: Node): string {
+  const [x, y, w, h] = node.bbox;
+  const lines = [`@name: ${node.name}`, `left: ${x}px`, `top: ${y}px`, `width: ${w}px`, `height: ${h}px`];
+  const fill = node.type === "VECTOR" ? node.vector?.fill : node.style?.fills?.[0]?.color;
+  if (fill) lines.push(`fill: ${fill}`);
+  const stroke = node.type === "VECTOR" ? node.vector?.stroke : node.style?.stroke?.color;
+  if (stroke) lines.push(`stroke: ${stroke}`);
+  const strokeWidth = node.type === "VECTOR" ? node.vector?.strokeWidth : node.style?.stroke?.weight;
+  if (strokeWidth != null) lines.push(`stroke-width: ${strokeWidth}px`);
+  if (node.style?.cornerRadius != null) lines.push(`border-radius: ${node.style.cornerRadius}${node.style.cornerRadiusUnit ?? "px"}`);
+  if (node.style?.opacity != null) lines.push(`opacity: ${node.style.opacity}`);
+  if (node.text) {
+    lines.push(`@text: ${node.text.chars}`);
+    lines.push(`font-family: ${node.text.fontFamily ?? "Inter, system-ui, sans-serif"}`);
+    lines.push(`font-size: ${node.text.fontSize}px`);
+    lines.push(`font-weight: ${node.text.fontWeight}`);
+    lines.push(`text-align: ${node.text.align.toLowerCase()}`);
+  }
+  if (node.layout?.display) lines.push(`display: ${node.layout.display}`);
+  if (node.layout?.gap != null) lines.push(`gap: ${node.layout.gap}px`);
+  if (node.layout?.padding != null) lines.push(`padding: ${node.layout.padding}px`);
+  return lines.join("\n");
+}
+
+function parseDeclarations(node: Node, raw: string): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const bbox: [number, number, number, number] = [...node.bbox];
+  let bboxChanged = false;
+  const stroke = { ...(node.style?.stroke ?? {}) };
+  let strokeChanged = false;
+  for (const line of raw.split(/\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("//")) continue;
+    const i = trimmed.indexOf(":");
+    if (i < 0) continue;
+    const key = trimmed.slice(0, i).trim().toLowerCase();
+    const value = trimmed.slice(i + 1).trim();
+    const px = parsePx(value);
+    if (key === "@name") patch.name = value;
+    else if (key === "@text" && node.type === "TEXT") patch["text.chars"] = value;
+    else if (key === "left" && px != null) {
+      bbox[0] = px;
+      bboxChanged = true;
+    } else if (key === "top" && px != null) {
+      bbox[1] = px;
+      bboxChanged = true;
+    } else if (key === "width" && px != null) {
+      bbox[2] = px;
+      bboxChanged = true;
+    } else if (key === "height" && px != null) {
+      bbox[3] = px;
+      bboxChanged = true;
+    } else if (key === "fill" && (HEX_RE.test(value) || value === "none")) {
+      if (node.type === "VECTOR") patch["vector.fill"] = value;
+      else patch["style.fills"] = value === "none" ? [] : [{ type: "SOLID", color: value }];
+    } else if (key === "stroke" && HEX_RE.test(value)) {
+      if (node.type === "VECTOR") patch["vector.stroke"] = value;
+      else {
+        stroke.color = value;
+        strokeChanged = true;
+      }
+    } else if (key === "stroke-width" && px != null) {
+      if (node.type === "VECTOR") patch["vector.strokeWidth"] = px;
+      else {
+        stroke.weight = px;
+        strokeChanged = true;
+      }
+    } else if (key === "border-radius" && px != null) patch["style.cornerRadius"] = px;
+    else if (key === "opacity") {
+      const n = Number(value);
+      if (!Number.isNaN(n)) patch["style.opacity"] = Math.max(0, Math.min(1, n));
+    } else if (key === "font-size" && px != null && node.type === "TEXT") patch["text.fontSize"] = px;
+    else if (key === "font-weight" && node.type === "TEXT") {
+      const n = Number(value);
+      if (!Number.isNaN(n)) patch["text.fontWeight"] = n;
+    } else if (key === "font-family" && node.type === "TEXT") patch["text.fontFamily"] = value;
+    else if (key === "text-align" && node.type === "TEXT") {
+      const align = value.toUpperCase();
+      if (["LEFT", "CENTER", "RIGHT", "JUSTIFY"].includes(align)) patch["text.align"] = align;
+    } else if (key === "display") patch["layout.display"] = value;
+    else if (key === "gap" && px != null) patch["layout.gap"] = px;
+    else if (key === "padding" && px != null) patch["layout.padding"] = px;
+  }
+  if (bboxChanged) patch.bbox = bbox;
+  if (strokeChanged) patch["style.stroke"] = stroke;
+  return patch;
+}
+
+function parsePx(raw: string): number | null {
+  const n = Number(raw.replace(/px$/i, "").trim());
+  return Number.isNaN(n) ? null : n;
 }
 
 // --------------------------------------------------------------------------
@@ -299,22 +724,33 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 const input: React.CSSProperties = {
-  padding: "5px 8px",
-  borderRadius: 6,
-  border: "1px solid #d1d5db",
+  padding: "6px 8px",
+  borderRadius: 8,
+  border: "1px solid var(--border)",
+  background: "#fff",
+  color: "var(--text)",
   fontSize: 13,
   fontFamily: "inherit",
   boxSizing: "border-box",
 };
 
+const tabButton: React.CSSProperties = {
+  padding: "6px 8px",
+  borderRadius: 8,
+  border: "1px solid",
+  fontSize: 12,
+  fontFamily: "inherit",
+  cursor: "pointer",
+};
+
 const header: React.CSSProperties = {
   fontSize: 13,
   fontWeight: 700,
-  color: "#111",
+  color: "var(--text)",
   marginBottom: 10,
 };
 
 const hint: React.CSSProperties = {
-  color: "#9ca3af",
+  color: "var(--muted-2)",
   fontSize: 13,
 };

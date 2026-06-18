@@ -164,6 +164,7 @@ export interface RunState {
   history: HistoryEntry[];
   banner: string | null; // single-writer rejection / transient notice
   canUndo: boolean;
+  canRedo: boolean;
 }
 
 class RunStore {
@@ -175,6 +176,7 @@ class RunStore {
     history: [],
     banner: null,
     canUndo: false,
+    canRedo: false,
   };
   private listeners = new Set<() => void>();
 
@@ -210,6 +212,7 @@ class RunStore {
       history: [],
       banner: null,
       canUndo: false,
+      canRedo: false,
     });
   }
 
@@ -278,7 +281,11 @@ class RunStore {
         });
         break;
       case "undone":
-        this.set({ canUndo: false });
+        break;
+      case "redone":
+        break;
+      case "history-state":
+        this.set({ canUndo: e.canUndo, canRedo: e.canRedo });
         break;
       case "rejected":
         this.set({ banner: e.reason });
@@ -298,7 +305,16 @@ export function useRunState(): RunState {
 // A minimal external store: the snapshot is the mode STRING itself (a stable
 // primitive), so useSyncExternalStore never tears or loops.
 // ---------------------------------------------------------------------------
-export type ToolMode = "select" | "frame" | "text" | "rect" | "ellipse";
+export type ToolMode =
+  | "select"
+  | "clickthrough"
+  | "frame"
+  | "text"
+  | "rect"
+  | "oval"
+  | "line"
+  | "arrow"
+  | "draw";
 
 class ToolModeStore {
   private mode: ToolMode = "select";

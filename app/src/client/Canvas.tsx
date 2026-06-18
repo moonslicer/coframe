@@ -14,6 +14,7 @@ import {
   useDocVersion,
   useRunState,
   useToolMode,
+  type ToolMode,
 } from "./stores.js";
 import { send, sendTool } from "./ws.js";
 import {
@@ -34,11 +35,23 @@ const REPARENT_ECHO_TIMEOUT_MS = 1500; // wait this long for the setBBox echo be
 
 // Default node size for a bare click (no rubber-band drag) in each create tool,
 // anchored at the click point. Tuned so a single tap drops a usable element.
-const CREATE_DEFAULTS: Record<string, [number, number]> = {
+type BoxTool = Extract<ToolMode, "frame" | "text" | "rect" | "oval">;
+type VectorTool = Extract<ToolMode, "line" | "arrow" | "draw">;
+
+const BOX_TOOLS = new Set<ToolMode>(["frame", "text", "rect", "oval"]);
+const VECTOR_TOOLS = new Set<ToolMode>(["line", "arrow", "draw"]);
+
+const CREATE_DEFAULTS: Record<BoxTool, [number, number]> = {
   frame: [320, 360],
   text: [200, 40],
   rect: [120, 40],
-  ellipse: [120, 40],
+  oval: [120, 40],
+};
+
+const DEFAULT_VECTOR_SIZE: Record<VectorTool, [number, number]> = {
+  line: [140, 24],
+  arrow: [140, 24],
+  draw: [80, 40],
 };
 
 // The in-flight pointer gesture. Null = idle. `kind:"select"` is a pending click that
@@ -68,14 +81,31 @@ type Gesture =
       // minted server-side on pointerup (it doesn't exist yet, so nothing to preview
       // via docMirror — we render the dashed box directly).
       kind: "create";
-      tool: Exclude<ReturnType<typeof getToolMode>, "select">;
+      tool: BoxTool;
       startX: number; // start corner in CANVAS coords
       startY: number;
       startClientX: number;
       startClientY: number;
       parent: NodeId; // deepest FRAME under the START point (resolved on pointerdown)
       rect: BBox | null; // live preview rect (null until the first move)
+    }
+  | {
+      kind: "vector";
+      tool: VectorTool;
+      startX: number;
+      startY: number;
+      startClientX: number;
+      startClientY: number;
+      parent: NodeId;
+      points: Array<[number, number]>; // canvas-space points until committed
+      preview: VectorPreview | null;
     };
+
+interface VectorPreview {
+  tool: VectorTool;
+  bbox: BBox;
+  points: Array<[number, number]>; // local to bbox
+}
 
 // Per-handle cursor so the affordance reads correctly. Diagonal handles get the
 // matching resize cursor; edges get the axis cursor.
@@ -107,6 +137,7 @@ export function Canvas() {
   // These DO need a re-render, so they live in React state (low-frequency relative
   // to bbox previews, which still go through docMirror.previewBboxes).
   const [createRect, setCreateRect] = useState<BBox | null>(null);
+  const [vectorPreview, setVectorPreview] = useState<VectorPreview | null>(null);
   const [reparentTarget, setReparentTarget] = useState<NodeId | null>(null);
 
   // Selection lives in the single doc-mirror source (drives this layer, the prompt
@@ -218,20 +249,67 @@ export function Canvas() {
     if (n) for (const c of n.children) subtreeIds(c, into);
   }
 
+  function normalizeVector(tool: VectorTool, points: Array<[number, number]>): VectorPreview {
+    const meaningful =
+      points.length >= 2
+        ? points
+        : [
+            points[0],
+            [points[0][0] + DEFAULT_VECTOR_SIZE[tool][0], points[0][1]],
+          ];
+    let minX = Math.min(...meaningful.map((p) => p[0]));
+    let minY = Math.min(...meaningful.map((p) => p[1]));
+    let maxX = Math.max(...meaningful.map((p) => p[0]));
+    let maxY = Math.max(...meaningful.map((p) => p[1]));
+    const strokePad = tool === "draw" ? 4 : 0;
+    minX -= strokePad;
+    minY -= strokePad;
+    maxX += strokePad;
+    maxY += strokePad;
+
+    let w = maxX - minX;
+    let h = maxY - minY;
+    if (w < MIN_SIZE) {
+      const pad = (MIN_SIZE - w) / 2;
+      minX -= pad;
+      w = MIN_SIZE;
+    }
+    if (h < MIN_SIZE) {
+      const pad = (MIN_SIZE - h) / 2;
+      minY -= pad;
+      h = MIN_SIZE;
+    }
+
+    const bbox: BBox = [minX, minY, w, h];
+    return {
+      tool,
+      bbox,
+      points: meaningful.map(([x, y]) => [x - minX, y - minY] as [number, number]),
+    };
+  }
+
+  function previewPath(preview: VectorPreview): string {
+    const [x, y] = preview.bbox;
+    return preview.points
+      .map(([px, py], i) => `${i === 0 ? "M" : "L"} ${x + px} ${y + py}`)
+      .join(" ");
+  }
+
   function onPointerDown(e: React.PointerEvent) {
     if (runActive) return; // all gestures disabled mid-run (single-writer guard)
     const el = e.target as Element;
     const cur = docMirror.selection;
 
-    // 0) A create tool is active → start a rubber-band that mints a new node on up.
-    //    The parent is the deepest FRAME under the START point (root as fallback).
+    // 0) Non-select tools are either inert click-through, box creation, or vector
+    //    point capture. The parent is the deepest FRAME under the START point.
     const tool = getToolMode();
-    if (tool !== "select") {
+    if (tool === "clickthrough") return;
+    if (BOX_TOOLS.has(tool)) {
       const [sx, sy] = toCanvas(e.clientX, e.clientY);
       const parent = frameUnder(el) ?? docMirror.store.rootId;
       gestureRef.current = {
         kind: "create",
-        tool,
+        tool: tool as BoxTool,
         startX: sx,
         startY: sy,
         startClientX: e.clientX,
@@ -240,6 +318,24 @@ export function Canvas() {
         rect: null,
       };
       setCreateRect(null);
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      return;
+    }
+    if (VECTOR_TOOLS.has(tool)) {
+      const [sx, sy] = toCanvas(e.clientX, e.clientY);
+      const parent = frameUnder(el) ?? docMirror.store.rootId;
+      gestureRef.current = {
+        kind: "vector",
+        tool: tool as VectorTool,
+        startX: sx,
+        startY: sy,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        parent,
+        points: [[sx, sy]],
+        preview: null,
+      };
+      setVectorPreview(null);
       (e.currentTarget as Element).setPointerCapture(e.pointerId);
       return;
     }
@@ -327,6 +423,23 @@ export function Canvas() {
       return;
     }
 
+    if (g.kind === "vector") {
+      if (g.tool === "draw") {
+        const last = g.points[g.points.length - 1];
+        const dist = Math.abs(cx - last[0]) + Math.abs(cy - last[1]);
+        if (dist >= 2) g.points.push([cx, cy]);
+      } else {
+        g.points = [
+          [g.startX, g.startY],
+          [cx, cy],
+        ];
+      }
+      const preview = normalizeVector(g.tool, g.points);
+      g.preview = preview;
+      setVectorPreview(preview);
+      return;
+    }
+
     // Only begin manipulating once past the threshold, so a plain click on a selected
     // node doesn't micro-nudge it.
     if (!g.dragging && movedPx <= DRAG_THRESHOLD) return;
@@ -382,9 +495,33 @@ export function Canvas() {
       if (g.tool === "frame") sendTool("createFrame", { parent, bbox });
       else if (g.tool === "text") sendTool("createText", { parent, chars: "Text", bbox });
       else if (g.tool === "rect") sendTool("createShape", { parent, kind: "RECT", bbox });
-      else if (g.tool === "ellipse") sendTool("createShape", { parent, kind: "ELLIPSE", bbox });
+      else if (g.tool === "oval") sendTool("createShape", { parent, kind: "ELLIPSE", bbox });
       setCreateRect(null);
       setToolMode("select"); // single-use create tool → revert to select after one drop
+      return;
+    }
+
+    if (g.kind === "vector") {
+      const preview =
+        g.preview ??
+        normalizeVector(g.tool, [
+          [g.startX, g.startY],
+          [g.startX + DEFAULT_VECTOR_SIZE[g.tool][0], g.startY],
+        ]);
+      if (g.tool === "draw" && g.points.length < 2) {
+        setVectorPreview(null);
+        setToolMode("select");
+        return;
+      }
+      docMirror.selectNextAdded();
+      sendTool("createVector", {
+        parent: g.parent,
+        kind: g.tool,
+        bbox: preview.bbox,
+        points: preview.points,
+      });
+      setVectorPreview(null);
+      setToolMode("select");
       return;
     }
 
@@ -455,7 +592,13 @@ export function Canvas() {
           setToolMode("select");
           return;
         }
-        if (g.kind !== "select" && g.dragging) {
+        if (g.kind === "vector") {
+          gestureRef.current = null;
+          setVectorPreview(null);
+          setToolMode("select");
+          return;
+        }
+        if ((g.kind === "move" || g.kind === "resize") && g.dragging) {
           docMirror.previewBboxes(g.orig); // snap back to where the drag began
           setReparentTarget(null);
           gestureRef.current = null;
@@ -497,7 +640,12 @@ export function Canvas() {
         alignItems: "center",
         padding: 24,
         boxSizing: "border-box",
-        cursor: runActive ? "default" : toolMode !== "select" ? "crosshair" : "pointer",
+        cursor:
+          runActive || toolMode === "clickthrough"
+            ? "default"
+            : toolMode !== "select"
+              ? "crosshair"
+              : "pointer",
       }}
     >
       {/* Sizing box reserves the SCALED footprint so the transform-scaled stage
@@ -517,7 +665,8 @@ export function Canvas() {
             position: "absolute",
             left: 0,
             top: 0,
-            boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
+            borderRadius: 2,
+            boxShadow: "0 18px 60px rgba(18,24,38,0.16), 0 1px 0 rgba(255,255,255,0.8)",
             transform: `scale(${fit})`,
             transformOrigin: "top left",
           }}
@@ -529,8 +678,14 @@ export function Canvas() {
           <SelectionLayer selection={selection} fit={fit} runActive={runActive} />
 
           {/* Transient gesture overlay: create rubber-band + reparent drop target. */}
-          {(createRect || reparentTarget) && (
-            <GestureOverlay createRect={createRect} reparentTarget={reparentTarget} fit={fit} />
+          {(createRect || vectorPreview || reparentTarget) && (
+            <GestureOverlay
+              createRect={createRect}
+              vectorPreview={vectorPreview}
+              vectorPath={vectorPreview ? previewPath(vectorPreview) : null}
+              reparentTarget={reparentTarget}
+              fit={fit}
+            />
           )}
 
           {/* Marks beat overlay — transient, from the live mirror bboxes. */}
@@ -548,9 +703,9 @@ export function Canvas() {
             right: 16,
             bottom: 96,
             width: 180,
-            border: "2px solid #7c3aed",
-            borderRadius: 6,
-            boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+            border: "2px solid var(--accent)",
+            borderRadius: 8,
+            boxShadow: "0 18px 60px rgba(18,24,38,0.22)",
             background: "#fff",
             zIndex: 30,
           }}
@@ -645,10 +800,14 @@ function SelectionLayer({
 // the gesture below.
 function GestureOverlay({
   createRect,
+  vectorPreview,
+  vectorPath,
   reparentTarget,
   fit,
 }: {
   createRect: BBox | null;
+  vectorPreview: VectorPreview | null;
+  vectorPath: string | null;
   reparentTarget: NodeId | null;
   fit: number;
 }) {
@@ -686,6 +845,28 @@ function GestureOverlay({
           strokeWidth={1.5 / fit}
           strokeDasharray={`${6 / fit} ${4 / fit}`}
         />
+      )}
+      {vectorPreview && vectorPath && (
+        <>
+          <rect
+            x={vectorPreview.bbox[0]}
+            y={vectorPreview.bbox[1]}
+            width={vectorPreview.bbox[2]}
+            height={vectorPreview.bbox[3]}
+            fill="none"
+            stroke="#2563eb"
+            strokeWidth={1 / fit}
+            strokeDasharray={`${4 / fit} ${4 / fit}`}
+          />
+          <path
+            d={vectorPath}
+            fill="none"
+            stroke="#2563eb"
+            strokeWidth={4 / fit}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </>
       )}
     </svg>
   );

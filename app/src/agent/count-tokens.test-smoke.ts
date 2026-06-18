@@ -62,7 +62,7 @@ async function main() {
     type: "text",
     text:
       `Current step [0]: Add a pricing section\n\n` +
-      `Scene graph (scoped, v${store.version}):\n${JSON.stringify(tree, null, 2)}\n\n` +
+      `Scene graph (scoped, v${store.version}):\n${JSON.stringify(tree)}\n\n` +
       `markMap (number -> NodeId): ${JSON.stringify(
         "markMap" in r ? r.markMap : {},
       )}`,

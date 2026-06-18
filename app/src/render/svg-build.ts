@@ -30,12 +30,21 @@ const pos = (n: Node) =>
 const cx = (n: Node) => num(n.bbox[0] + n.bbox[2] / 2);
 const cy = (n: Node) => num(n.bbox[1] + n.bbox[3] / 2);
 const fillColor = (n: Node) => n.style?.fills?.find((f) => f.type === "SOLID")?.color;
-const fill = (n: Node) => `fill="${fillColor(n) ?? "none"}"`;
+const fill = (n: Node) => `fill="${fillColor(n) ?? (n.type === "FRAME" ? "transparent" : "none")}"`;
+const nodeAttrs = (n: Node) => `data-node-id="${n.id}" data-dc-tpl="${esc(n.tid ?? n.id)}"`;
 // Border, when present — what keeps a white card visible on the white page.
 const stroke = (n: Node) => {
   const s = n.style?.stroke;
-  return s ? ` stroke="${s.color}" stroke-width="${num(s.weight ?? 1)}"` : "";
+  if (!s || s.style === "none") return "";
+  const dash =
+    s.style === "dashed"
+      ? ` stroke-dasharray="${num(s.weight ?? 1) * 3} ${num(s.weight ?? 1) * 2}"`
+      : s.style === "dotted"
+        ? ` stroke-dasharray="0 ${num(s.weight ?? 1) * 2}"`
+        : "";
+  return ` stroke="${s.color}" stroke-width="${num(s.weight ?? 1)}"${dash}`;
 };
+const opacity = (n: Node) => (n.style?.opacity != null ? ` opacity="${num(n.style.opacity)}"` : "");
 
 function esc(s: string): string {
   return s
@@ -50,17 +59,18 @@ type DrawFn = (n: Node) => string;
 
 const DRAW: Record<Node["type"], DrawFn> = {
   RECT: (n) =>
-    `<rect ${pos(n)} ${fill(n)}${stroke(n)} rx="${num(n.style?.cornerRadius ?? 0)}" data-node-id="${n.id}"/>`,
+    `<rect ${pos(n)} ${fill(n)}${stroke(n)}${opacity(n)} rx="${num(n.style?.cornerRadius ?? 0)}" ${nodeAttrs(n)}/>`,
 
   ELLIPSE: (n) =>
     `<ellipse cx="${cx(n)}" cy="${cy(n)}" rx="${num(n.bbox[2] / 2)}" ry="${num(
       n.bbox[3] / 2,
-    )}" ${fill(n)}${stroke(n)} data-node-id="${n.id}"/>`,
+    )}" ${fill(n)}${stroke(n)}${opacity(n)} ${nodeAttrs(n)}/>`,
 
   TEXT: (n) => {
     const fs = n.text?.fontSize ?? 16;
     const fw = n.text?.fontWeight ?? 400;
-    const color = fillColor(n) ?? "#111111";
+    const color = n.text?.color ?? fillColor(n) ?? "#111111";
+    const family = n.text?.fontFamily ?? "Inter, system-ui, sans-serif";
     const anchor =
       n.text?.align === "CENTER" ? "middle" : n.text?.align === "RIGHT" ? "end" : "start";
     // text-anchor x reference: left/center/right edge of the bbox.
@@ -71,22 +81,75 @@ const DRAW: Record<Node["type"], DrawFn> = {
           ? num(n.bbox[0] + n.bbox[2])
           : num(n.bbox[0]);
     const ty = num(n.bbox[1] + fs); // baseline ~ top + fontSize
+    const styleBits = [
+      n.text?.fontStyle === "italic" ? `font-style="italic"` : "",
+      n.text?.textDecoration?.length ? `text-decoration="${esc(n.text.textDecoration.join(" "))}"` : "",
+      n.text?.letterSpacingEm != null ? `letter-spacing="${num(n.text.letterSpacingEm)}em"` : "",
+    ].filter(Boolean);
     return (
-      `<text x="${tx}" y="${ty}" font-family="Inter, system-ui, sans-serif" ` +
+      `<text x="${tx}" y="${ty}" font-family="${esc(family)}" ` +
       `font-size="${fs}" font-weight="${fw}" fill="${color}" ` +
-      `text-anchor="${anchor}" data-node-id="${n.id}">${esc(n.text?.chars ?? "")}</text>`
+      `text-anchor="${anchor}"${styleBits.length ? ` ${styleBits.join(" ")}` : ""}${opacity(n)} ` +
+      `${nodeAttrs(n)}>${esc(n.text?.chars ?? "")}</text>`
     );
   },
 
   FRAME: (n) =>
-    `<rect ${pos(n)} ${fill(n)}${stroke(n)} rx="${num(n.style?.cornerRadius ?? 0)}" data-node-id="${n.id}"/>`,
+    `<rect ${pos(n)} ${fill(n)}${stroke(n)}${opacity(n)} rx="${num(n.style?.cornerRadius ?? 0)}" ${nodeAttrs(n)}/>`,
 
-  // reserved types — additive. Stubbed to '' until their milestone.
-  VECTOR: () => "",
+  VECTOR: (n) => vectorNode(n),
   COMPONENT: () => "",
   INSTANCE: () => "",
   GROUP: () => "",
 };
+
+function vectorNode(n: Node): string {
+  const v = n.vector;
+  if (!v || v.points.length < 2) return "";
+  const points = v.points.map((p) => vectorPoint(n, p));
+  const d = points
+    .map(([x, y], i) => `${i === 0 ? "M" : "L"} ${num(x)} ${num(y)}`)
+    .join(" ");
+  const strokeWidth = num(v.strokeWidth ?? 4);
+  const path =
+    `<path d="${d}" fill="${esc(v.fill ?? "none")}" stroke="${esc(v.stroke)}" ` +
+    `stroke-width="${strokeWidth}" stroke-linecap="${v.linecap ?? "round"}" ` +
+    `stroke-linejoin="${v.linejoin ?? "round"}"${opacity(n)} ${nodeAttrs(n)}/>`;
+  if (v.kind !== "arrow") return path;
+  const head = arrowHead(points, strokeWidth, n);
+  return path + head;
+}
+
+function vectorPoint(n: Node, p: [number, number]): [number, number] {
+  const v = n.vector;
+  if (!v) return [n.bbox[0] + p[0], n.bbox[1] + p[1]];
+  const [vx, vy, vw, vh] = v.viewBox;
+  const sx = n.bbox[2] / Math.max(1, vw);
+  const sy = n.bbox[3] / Math.max(1, vh);
+  return [n.bbox[0] + (p[0] - vx) * sx, n.bbox[1] + (p[1] - vy) * sy];
+}
+
+function arrowHead(points: Array<[number, number]>, strokeWidth: number, n: Node): string {
+  const end = points[points.length - 1];
+  const prev = points[points.length - 2];
+  const angle = Math.atan2(end[1] - prev[1], end[0] - prev[0]);
+  const size = Math.max(8, strokeWidth * 3);
+  const spread = Math.PI / 7;
+  const left: [number, number] = [
+    end[0] - Math.cos(angle - spread) * size,
+    end[1] - Math.sin(angle - spread) * size,
+  ];
+  const right: [number, number] = [
+    end[0] - Math.cos(angle + spread) * size,
+    end[1] - Math.sin(angle + spread) * size,
+  ];
+  const d = `M ${num(left[0])} ${num(left[1])} L ${num(end[0])} ${num(end[1])} L ${num(right[0])} ${num(right[1])}`;
+  return (
+    `<path d="${d}" fill="none" stroke="${esc(n.vector?.stroke ?? "#8A8378")}" ` +
+    `stroke-width="${strokeWidth}" stroke-linecap="${n.vector?.linecap ?? "round"}" ` +
+    `stroke-linejoin="${n.vector?.linejoin ?? "round"}"${opacity(n)} ${nodeAttrs(n)}/>`
+  );
+}
 
 function markFor(m: string, n: Node): string {
   const [x, y, w, h] = n.bbox.map(num);

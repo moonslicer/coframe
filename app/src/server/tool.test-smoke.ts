@@ -1,8 +1,8 @@
 // Headless WS smoke for the HUMAN-EDIT path (Step 2). Boots the server in-process
 // and drives {t:"tool"} over a real WebSocket — NO Anthropic call anywhere. Asserts
 // success echoes via ops-applied, server-minted create ids flow back, bad-id and
-// stale-version mutations are rejected, and the human edits coalesce into ONE undo
-// level. Mirrors the harness shape of server.test-smoke.ts.
+// stale-version mutations are rejected, and human edits can undo/redo through the
+// snapshot ring. Mirrors the harness shape of server.test-smoke.ts.
 //
 //   npm run smoke:tool
 import dotenv from "dotenv";
@@ -108,11 +108,28 @@ async function main() {
   const r5 = await waitForFrom(received, received.length, (m) => m.t === "rejected");
   check("5 stale version -> rejected STALE", r5.t === "rejected" && r5.reason.includes("STALE"), r5.t === "rejected" ? r5.reason : "");
 
-  // ---- 6. undo coalescing: one undo restores the pre-edit node count ----
+  // ---- 6. undo/redo ring: each committed human tool edit is its own history step ----
+  let from = received.length;
   send({ t: "undo" });
-  const r6 = await waitFor(received, (m) => m.t === "undone");
-  const undoneCount = r6.t === "undone" ? r6.nodes.length : -1;
-  check("6 undo coalesces all human edits to one level", undoneCount === preCount, `pre=${preCount} undone=${undoneCount}`);
+  const r6 = await waitForFrom(received, from, (m) => m.t === "undone");
+  const undoOneCount = r6.t === "undone" ? r6.nodes.length : -1;
+  check(
+    "6 undo reverts one human edit, keeping created node",
+    undoOneCount === preCount + 1,
+    `pre=${preCount} undoOne=${undoOneCount}`,
+  );
+
+  from = received.length;
+  send({ t: "undo" });
+  const r7 = await waitForFrom(received, from, (m) => m.t === "undone");
+  const undoTwoCount = r7.t === "undone" ? r7.nodes.length : -1;
+  check("7 second undo removes created node", undoTwoCount === preCount, `pre=${preCount} undoTwo=${undoTwoCount}`);
+
+  from = received.length;
+  send({ t: "redo" });
+  const r8 = await waitForFrom(received, from, (m) => m.t === "redone");
+  const redoCount = r8.t === "redone" ? r8.nodes.length : -1;
+  check("8 redo restores created node", redoCount === preCount + 1, `redo=${redoCount}`);
 
   ws.close();
 

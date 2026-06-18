@@ -18,7 +18,8 @@ function wsUrl(): string {
 function route(msg: ServerMessage) {
   switch (msg.t) {
     case "doc-sync":
-    case "undone": {
+    case "undone":
+    case "redone": {
       // A genuine seed switch invalidates the previous doc's run history/activity.
       const seedChanged =
         msg.t === "doc-sync" && msg.seedDocId != null && msg.seedDocId !== docMirror.seedDocId;

@@ -23,6 +23,15 @@ if (fires !== 1) fail(`subscriber should fire once on change, fired ${fires}`);
 setToolMode("rect"); // unchanged -> no-op, no notify
 if (fires !== 1) fail(`subscriber must NOT fire on unchanged set, fired ${fires}`);
 
+setToolMode("arrow");
+if (getToolMode() !== "arrow") fail(`after set expected "arrow", got "${getToolMode()}"`);
+if (fires !== 2) fail(`subscriber should fire for arrow change, fired ${fires}`);
+
+setToolMode("clickthrough");
+if (getToolMode() !== "clickthrough")
+  fail(`after set expected "clickthrough", got "${getToolMode()}"`);
+if (fires !== 3) fail(`subscriber should fire for clickthrough change, fired ${fires}`);
+
 unsub();
 
 if (ok) {

@@ -17,23 +17,56 @@ import type { DocStore } from "../shared/store.js";
 import type { NodeId } from "../shared/types.js";
 import { isErr } from "../shared/types.js";
 import { dispatch, REGISTRY } from "../shared/tools.js";
-import { getTree, fieldsFor, render } from "../render/perception.js";
+import { getTree, fieldsFor, render, getMarks } from "../render/perception.js";
 import type { TaskHint } from "../render/perception.js";
 import { verifyContentCompleteness, verifyStructural } from "./verify.js";
 import type { RunController } from "./run-controller.js";
-import { perceptionBlocks } from "./llm-adapter.js";
+import { perceptionBlocks, pruneStalePerception } from "./llm-adapter.js";
 import type { ContentBlockParam, ActDelta } from "./llm-adapter.js";
 import type { Step } from "./types.js";
 
-const MAX_ATTEMPTS = 3; // bounded retry per failing step
-// Hard ceiling on total model turns so a run can't blow its token budget. A flat 12
-// starved thorough multi-element plans (a 6-step login form needs ~1-2 turns/step plus
-// retries) — escalating them half-built. Scale with plan length, floored at 12 and
-// capped so a runaway plan still can't spin forever.
-const MAX_TURNS_PER_STEP = 4;
-const MAX_TURNS_CAP = 40;
-const turnBudgetFor = (planLength: number) =>
-  Math.min(MAX_TURNS_CAP, Math.max(12, planLength * MAX_TURNS_PER_STEP));
+const MAX_ATTEMPTS = 3; // bounded retry for a SIMPLE step (create/restyle/align verifies in 1-2 turns)
+// A multi-item content step (a 6-card hourly strip, a 7-day list, a 4-tile grid) is the
+// hard case: the act model emits ONE tool call per turn (it re-perceives between calls and
+// will not batch a whole set into one response, no matter how the prompt asks), and each
+// item costs ~2 calls (its frame + the text/shape inside). At MAX_ATTEMPTS=3 such a step
+// can place at most ~3 nodes, so it ALWAYS ships half-built (2 cards instead of 6) and
+// verify rightly fails. The fix is to size the per-step budget to the count the step asks
+// for, so one-tool-per-turn building can actually finish. Simple steps are unaffected: they
+// verify and break long before the larger ceiling.
+const MAX_ATTEMPTS_CEILING = 16;
+const MAX_TURNS_CAP = 80;
+
+/** The item count a step targets, for budgeting: its childCount criterion's minimum, raised
+ *  by any explicit count in the label ("6 cards", "7-day", "4 tiles"). 0 when not a set. */
+function targetCount(step: Step): number {
+  const c = step.criterion as { kind: string; count?: number };
+  let n = (c.kind === "childCount" || c.kind === "childCountNamed") && typeof c.count === "number" ? c.count : 0;
+  // A count followed (possibly across a few filler words like "time/icon/temp") by a
+  // content unit: "6 time/icon/temp cards", "5 time-slot cards", "7-day", "4 tiles",
+  // "8 video thumbnails", "6 game levels", "5 track rows". The curated nouns keep the
+  // common singular-with-count forms ("7-day"), and the trailing `[a-z]{4,}s` catches
+  // ANY novel plural unit so a non-demo design system ("thumbnails"/"levels"/"tracks"/
+  // "stories"/"avatars") still sizes its budget. Over-counting is safe: it only RAISES
+  // the ceiling, which a simple step never reaches (it verifies and breaks early).
+  const m = /(\d+)[^\d]{0,24}?\b(?:cards?|tiles?|rows?|items?|days?|slots?|columns?|cols?|tiers?|bars?|dots?|pills?|[a-z]{4,}s)\b/i.exec(
+    step.label,
+  );
+  if (m) n = Math.max(n, parseInt(m[1], 10));
+  return n;
+}
+
+/** Per-step retry budget: simple steps get MAX_ATTEMPTS; a set of N items gets ~2 turns
+ *  per item (frame + child), bounded by the ceiling. */
+function attemptsFor(step: Step): number {
+  const n = targetCount(step);
+  return n <= MAX_ATTEMPTS ? MAX_ATTEMPTS : Math.min(MAX_ATTEMPTS_CEILING, n * 2 + 2);
+}
+
+/** Total turn ceiling: the SUM of every step's budget (+ slack), so a legitimately heavy
+ *  multi-section plan never trips the global abort mid-build, while a runaway still stops. */
+const turnBudgetFor = (plan: Step[]): number =>
+  Math.min(MAX_TURNS_CAP, plan.reduce((sum, s) => sum + attemptsFor(s), 0) + plan.length);
 
 /** Resolve the working frame: the selection's common parent, else the page root. */
 function resolveRoot(store: DocStore, selection: NodeId[]): NodeId {
@@ -42,6 +75,22 @@ function resolveRoot(store: DocStore, selection: NodeId[]): NodeId {
     if (first?.parent) return first.parent;
   }
   return store.rootId;
+}
+
+/**
+ * Should THIS turn pay for the rasterized vision channel (~1k image tokens to the
+ * model + a full-res PNG over the wire)? Vision is high-value for the FIRST look at a
+ * spatial step (grounding what to build / where) and for re-judging a layout re-flow.
+ * It is low-value on restyle/skeleton turns (decided from style/text fields) and on
+ * create/restyle RETRIES — those are driven by the fresh scene-graph tree (exact
+ * post-edit bboxes) plus the structural-verify evidence, so re-screenshotting just
+ * re-pays for a near-identical picture. Net effect: an N-turn build sends ~1 image,
+ * not N, with no loss of the spatial grounding that drives output quality.
+ */
+function wantImage(hint: TaskHint, attempt: number): boolean {
+  if (hint === "restyle" || hint === "skeleton") return false;
+  if (attempt === 0) return true; // first look at a create/layout step
+  return hint === "layout"; // only layout retries need to re-see the result
 }
 
 /** Coarse task hint for field projection, derived from a step's criterion. */
@@ -65,6 +114,24 @@ function hintFor(step: Step): TaskHint {
     default:
       return "skeleton";
   }
+}
+
+/** True when a tool call would REPOSITION (change x or y of) a FRAME that has children
+ *  via the absolute setBBox/setBBoxes path — which leaves the children behind. Used to veto
+ *  such an op in the refine pass (pure resizes and leaf moves return false). */
+function movesPopulatedFrame(name: string, input: unknown, store: DocStore): boolean {
+  if (name !== "setBBox" && name !== "setBBoxes") return false;
+  const items =
+    name === "setBBox"
+      ? [(input as { id?: NodeId; bbox?: number[] })]
+      : ((input as { items?: { id?: NodeId; bbox?: number[] }[] }).items ?? []);
+  for (const it of items) {
+    const node = it?.id ? store.getNode(it.id) : undefined;
+    if (!node || node.type !== "FRAME" || node.children.length === 0) continue;
+    const b = it.bbox;
+    if (Array.isArray(b) && (b[0] !== node.bbox[0] || b[1] !== node.bbox[1])) return true;
+  }
+  return false;
 }
 
 /** The streamed activity verb+params for a tool call (label from the registry). */
@@ -113,7 +180,7 @@ export async function runTask(
 
   let plan: Step[];
   try {
-    plan = await planIntent(intent, rootId, store, selection);
+    plan = await planIntent(intent, rootId, store, selection, (u) => rc.addUsage(u));
   } catch (e) {
     return rc.finishEscalated(`Planning failed: ${(e as Error).message}`);
   }
@@ -125,7 +192,7 @@ export async function runTask(
   rc.emitPlan(plan);
 
   let turns = 0;
-  const maxTurns = turnBudgetFor(plan.length);
+  const maxTurns = turnBudgetFor(plan);
   const originalIds = new Set(rc.snapshot.nodes.keys());
 
   // Steps whose criterion never verified after MAX_ATTEMPTS. A single such step must
@@ -138,8 +205,9 @@ export async function runTask(
   for (const step of plan) {
     rc.setStep(step);
     let verified = false;
+    const stepAttempts = attemptsFor(step);
 
-    while (rc.attempts < MAX_ATTEMPTS) {
+    while (rc.attempts < stepAttempts) {
       if (++turns > maxTurns) {
         store.restore(rc.snapshot);
         return rc.finishEscalated("Hit the turn budget; restored pre-run state.");
@@ -147,20 +215,50 @@ export async function runTask(
 
       // PERCEIVE: fresh scoped re-read each step (no getChanges)
       rc.transition("PERCEIVING");
-      const tree = getTree(store, rootId, { depth: 5, fields: fieldsFor(hintFor(step)) });
+      const hint = hintFor(step);
+      const tree = getTree(store, rootId, { depth: 5, fields: fieldsFor(hint) });
       if ("error" in tree) {
         store.restore(rc.snapshot);
         return rc.finishEscalated(`Lost the working frame (${tree.detail}).`);
       }
-      const r = await render(store, rootId, { marks: true, maxPx: 1024 });
-      if ("error" in r) {
-        store.restore(rc.snapshot);
-        return rc.finishEscalated(`Lost the working frame (${r.detail}).`);
+      // Rasterize ONLY when this turn wants vision (see wantImage). Otherwise compute
+      // the markMap alone — no resvg, no PNG bytes — so the turn runs text-only on the
+      // fresh scene-graph tree + verify evidence. The client overlay needs only markMap.
+      let image: string | null = null;
+      let markMap: Record<string, NodeId> = {};
+      let version: number;
+      // Skip the FIRST image of a build that starts from a near-empty canvas: a marked
+      // render of an empty (or root-only) frame teaches the model nothing yet costs ~1.4k
+      // image tokens + a resvg rasterize. Once content exists (a later attempt, or an edit
+      // on an already-populated canvas) the image is worth it again — that's the refine look.
+      const emptyish = tree.nodes.length <= 3;
+      const useImage =
+        wantImage(hint, rc.attempts) && !(!process.env.NO_COMPOSE && emptyish && rc.attempts === 0);
+      if (useImage) {
+        const r = await render(store, rootId, { marks: true, maxPx: 1024 });
+        if ("error" in r) {
+          store.restore(rc.snapshot);
+          return rc.finishEscalated(`Lost the working frame (${r.detail}).`);
+        }
+        image = r.rasterAvailable ? r.image : null; // guard the render union
+        markMap = r.markMap;
+        version = r.version;
+      } else {
+        const m = getMarks(store, rootId, { maxPx: 1024 });
+        if ("error" in m) {
+          store.restore(rc.snapshot);
+          return rc.finishEscalated(`Lost the working frame (${m.detail}).`);
+        }
+        markMap = m.markMap;
+        version = m.version;
       }
-      // guard the render union — never feed an undefined image to the model
-      const image = r.rasterAvailable ? r.image : null;
-      rc.baseVersion = r.version;
-      rc.emitMarks(image ?? "", r.markMap);
+      rc.baseVersion = version;
+      // The client draws its overlay boxes from markMap; the PNG (only present on vision
+      // turns) just refreshes the decorative "agent's-eye" thumbnail. On text-only turns
+      // image is "" (falsy) so the thumbnail holds — markMap still flows for the overlay,
+      // and the full-res PNG never crosses the wire.
+      rc.emitMarks(image ?? "", markMap);
+      const modelImage = image;
 
       // ACT: one streaming model turn emitting tool_use, executed via the registry.
       // The stream's onDelta emits the activity line the INSTANT a tool_use block
@@ -188,8 +286,13 @@ export async function runTask(
       // Persist the per-turn perception as a user turn BEFORE act, so the request
       // ALWAYS starts with a user turn (otherwise call #2+ would begin with the prior
       // assistant tool_use turn -> Anthropic 400 "first message must be user").
-      rc.pushUser(perceptionBlocks({ tree, image, markMap: r.markMap, version: r.version, step, selection: rc.selection }));
+      rc.pushUser(perceptionBlocks({ tree, image: modelImage, markMap: modelImage ? markMap : {}, version, step, selection: rc.selection }));
+      // Strip stale images + scene-graphs from prior turns: each turn re-perceives, so
+      // only THIS perception is current — keeping the rest is an O(n²) token blowup.
+      pruneStalePerception(rc.messages);
       const turn = await act(rc.messages, onDelta);
+      rc.addUsage(turn.usage);
+      rc.turns = turns;
       if (turn.stopReason === "refusal") {
         store.restore(rc.snapshot);
         return rc.finishEscalated("The model declined the request.");
@@ -290,6 +393,70 @@ export async function runTask(
       // SERVER's pre-run snapshot (restored on `undo`), not a loop-internal rollback; the
       // run-end doc-sync mirrors whatever we keep here, so a single Cmd-Z still clears it.
       failedSteps.push(step.label);
+    }
+  }
+
+  // REFINE — the "render once, then fix" pass. Bulk building (composeSubtree) is fast but
+  // skips the per-node visual feedback that catches overlap / misalignment / weak hierarchy.
+  // We restore that quality gate ONCE for the whole run instead of once per node: render the
+  // finished frame a single time and let the model make targeted fixes. Gated on having built
+  // real content and not having already failed outright. One image + one act turn — its own
+  // fresh context so it never bloats the build history.
+  const newNodes = store.count() - originalIds.size;
+  if (!process.env.NO_COMPOSE && newNodes >= 4 && failedSteps.length < plan.length) {
+    rc.transition("PERCEIVING");
+    const r = await render(store, rootId, { marks: true, maxPx: 1024 });
+    const tree = getTree(store, rootId, { depth: 6, fields: ["style", "text", "layout"] });
+    if (!("error" in r) && r.rasterAvailable && !("error" in tree)) {
+      rc.baseVersion = r.version;
+      rc.emitMarks(r.image, r.markMap);
+      const reviewId = rc.emitActivity("Reviewing the design…");
+      const messages: ContentBlockParam[] = [
+        {
+          type: "text",
+          text:
+            `You just built this design for the request: "${intent}".\n` +
+            `Take ONE careful look at the rendered result and fix only CLEAR problems: overlapping or ` +
+            `clipped elements, misalignment, uneven spacing, weak hierarchy, or low contrast. Make ` +
+            `targeted edits with tools (setProps, setFill, setTextStyle, applyAutoLayout, alignDistribute, ` +
+            `placeBelow, or composeSubtree for a genuinely missing piece). Do NOT rebuild what is already fine.\n` +
+            `IMPORTANT: to REPOSITION a frame that has children, use alignDistribute or placeBelow (they carry ` +
+            `the children with it). Do NOT use setBBox/setBBoxes to move a container — that moves the frame ` +
+            `alone and leaves its children behind. setBBox is only for a single leaf node or a pure resize.\n\n` +
+            `Scene graph (v${r.version}):\n${JSON.stringify(tree)}\n\n` +
+            `markMap (number -> NodeId): ${JSON.stringify(r.markMap)}`,
+        },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: r.image } },
+        { type: "text", text: "If it already looks polished, make NO tool calls and stop." },
+      ];
+      rc.transition("ACTING");
+      rc.turns += 1;
+      const turn = await act([{ role: "user", content: messages }]);
+      rc.addUsage(turn.usage);
+      rc.updateActivity(reviewId, "ok");
+      if (turn.stopReason !== "refusal") {
+        for (const tu of turn.toolUses) {
+          const actId = rc.emitActivity(labelFor(tu.name, tu.input), tu.name);
+          // GUARD: a refine fix must never MOVE a container with setBBox/setBBoxes — those
+          // are absolute single-node ops that leave the frame's children behind (the SVG/DOM
+          // uses absolute coords, so a moved parent orphans its subtree). composeSubtree
+          // already places sections correctly; if the model still tries to reposition a
+          // populated frame this way, skip it rather than corrupt the layout. (Pure resizes
+          // and leaf moves are fine — only a moved FRAME-with-children is blocked.)
+          if (movesPopulatedFrame(tu.name, tu.input, store)) {
+            rc.updateActivity(actId, "failed", "skipped: setBBox would orphan the frame's children");
+            continue;
+          }
+          const result = dispatch(tu.name, tu.input, store, rc.baseVersion);
+          if (!isErr(result)) {
+            rc.baseVersion = result.version;
+            rc.emitOpsApplied(result.ops, result.version, actId);
+            rc.updateActivity(actId, "ok");
+          } else {
+            rc.updateActivity(actId, "failed", `${result.error}: ${result.detail}`);
+          }
+        }
+      }
     }
   }
 

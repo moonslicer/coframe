@@ -14,6 +14,7 @@
 import type { DocStore } from "../shared/store.js";
 import type { Node, NodeId } from "../shared/types.js";
 import { renderPng } from "./raster.js";
+import { buildSvg } from "./svg-build.js";
 
 // ---- getTree: scoped, depth-limited, field-projected structured read ----
 
@@ -171,4 +172,29 @@ export async function render(
     markMap: r.markMap,
     version: r.version,
   };
+}
+
+// ---- getMarks: the markMap WITHOUT rasterizing (for text-only model turns) ----
+
+export interface GetMarksOk {
+  markMap: Record<string, NodeId>;
+  version: number;
+}
+export type GetMarksResult = GetMarksOk | RenderError;
+
+/**
+ * The numbered markMap (number -> NodeId) and current version, WITHOUT producing a
+ * PNG. buildSvg computes the markMap as a by-product of laying out the scene, so we
+ * skip the expensive resvg rasterize entirely on turns that don't send the image to
+ * the model. The client overlay draws its own boxes from this markMap, so the UI is
+ * unaffected; we just don't pay for pixels nobody needs this turn.
+ */
+export function getMarks(
+  store: DocStore,
+  rootId: NodeId,
+  opts: { maxPx?: number } = {},
+): GetMarksResult {
+  if (!store.has(rootId)) return { error: "BAD_ID", detail: rootId };
+  const { markMap } = buildSvg(store, rootId, { marks: true, maxPx: opts.maxPx ?? 1024 });
+  return { markMap, version: store.version };
 }

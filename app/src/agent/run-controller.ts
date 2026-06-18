@@ -32,6 +32,16 @@ export type ServerEvent =
   | { t: "marks"; image: string; markMap: Record<string, NodeId> }
   | { t: "ops-applied"; ops: Op[]; version: DocVersion; activityId?: string }
   | {
+      // Run-cost telemetry: cumulative token usage + model-turn count for the whole run.
+      // Emitted once, just before the terminal done/escalated event.
+      t: "usage";
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheCreate: number;
+      turns: number;
+    }
+  | {
       t: "done";
       label: string;
       summary: string;
@@ -117,9 +127,25 @@ export class RunController {
     this.emit({ t: "ops-applied", ops, version, activityId });
   }
 
+  // --- run-cost telemetry: cumulative token usage + model-turn count ---
+  usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  turns = 0;
+
+  addUsage(u: { input: number; output: number; cacheRead: number; cacheCreate: number }) {
+    this.usage.input += u.input;
+    this.usage.output += u.output;
+    this.usage.cacheRead += u.cacheRead;
+    this.usage.cacheCreate += u.cacheCreate;
+  }
+
+  emitUsage() {
+    this.emit({ t: "usage", ...this.usage, turns: this.turns });
+  }
+
   // --- terminal transitions ---
 
   finishDone(summary: string): void {
+    this.emitUsage();
     this.transition("DONE");
     this.emit({
       t: "done",
@@ -131,6 +157,7 @@ export class RunController {
   }
 
   finishEscalated(reason: string): void {
+    this.emitUsage();
     this.transition("ESCALATED");
     this.emit({ t: "escalated", label: "Agent run", reason });
   }

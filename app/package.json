@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "probe": "tsx src/agent/design-probe.ts",
+    "compose-eval": "tsx src/agent/compose-eval.ts",
     "session": "tsx src/agent/design-session.ts",
     "smoke": "tsx src/render/svg-build.test-smoke.ts",
     "smoke:raster": "tsx src/render/raster.test-smoke.ts",
@@ -30,6 +31,7 @@
     "@resvg/resvg-js": "^2.6.2",
     "dotenv": "^16.6.1",
     "hono": "^4.12.25",
+    "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.21.0"

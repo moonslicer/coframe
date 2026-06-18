@@ -26,12 +26,13 @@ let activeSeedId = DEFAULT_SEED_ID;
 store.loadSeed(getSeed(activeSeedId).seed);
 
 // Per-connection nothing is held server-side; the doc is shared (single-writer demo).
-// We keep the last pre-run snapshot keyed at the process level so undo can restore it.
+// A bounded snapshot ring gives the human palette normal Undo/Redo. This is still a
+// single-user implementation detail; the op boundary remains the future multiplayer
+// migration path.
 type Snapshot = ReturnType<DocStore["snapshot"]>;
-let lastSnapshot: Snapshot | null = null;
-let lastRunVersion = 0; // doc version AT the time the run started (for undo bookkeeping)
-// Pending human edits since the last run/undo should coalesce into the next run's undo level.
-let humanDirty = false;
+const HISTORY_LIMIT = 50;
+let undoStack: Snapshot[] = [];
+let redoStack: Snapshot[] = [];
 
 // The run guard: while a run is active, human mutations are rejected (single writer).
 let activeRC: RunController | null = null;
@@ -45,7 +46,7 @@ function nodesArray(): Node[] {
   return [...store.all().values()];
 }
 
-function docSync(t: "doc-sync" | "undone"): ServerMessage {
+function docSync(t: "doc-sync" | "undone" | "redone"): ServerMessage {
   return {
     t,
     nodes: nodesArray(),
@@ -57,6 +58,16 @@ function docSync(t: "doc-sync" | "undone"): ServerMessage {
 
 function send(ws: WebSocket, msg: ServerMessage) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function pushUndoSnapshot(snapshot: Snapshot) {
+  undoStack.push(snapshot);
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack = [];
+}
+
+function sendHistoryState(ws: WebSocket) {
+  send(ws, { t: "history-state", canUndo: undoStack.length > 0, canRedo: redoStack.length > 0 });
 }
 
 // ---- Hono app (static bundle in prod; in dev Vite serves the client + proxies /ws) ----
@@ -72,6 +83,7 @@ const wss = new WebSocketServer({ server: server as any, path: "/ws" });
 wss.on("connection", (ws: WebSocket) => {
   // On connect: full doc-sync so the mirror is authoritative immediately.
   send(ws, docSync("doc-sync"));
+  sendHistoryState(ws);
 
   ws.on("message", async (raw: Buffer) => {
     let msg: ClientMessage;
@@ -93,6 +105,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
 
     case "resync":
       send(ws, docSync("doc-sync"));
+      sendHistoryState(ws);
       return;
 
     case "loadSeed": {
@@ -104,9 +117,10 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
       const { id, seed } = getSeed(msg.seedDocId);
       activeSeedId = id;
       store.loadSeed(seed);
-      lastSnapshot = null;
-      humanDirty = false;
+      undoStack = [];
+      redoStack = [];
       send(ws, docSync("doc-sync"));
+      sendHistoryState(ws);
       return;
     }
 
@@ -115,14 +129,32 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         send(ws, { t: "rejected", reason: "A run is in progress." });
         return;
       }
-      if (!lastSnapshot || store.version === lastRunVersion) {
-        // One undo level; a second Cmd-Z is a no-op (already at pre-run state).
+      const snapshot = undoStack.pop();
+      if (!snapshot) {
+        sendHistoryState(ws);
         return;
       }
-      store.restore(lastSnapshot);
-      lastSnapshot = null; // one undo level only — no redo, no ring
-      humanDirty = false;
+      redoStack.push(store.snapshot());
+      store.restore(snapshot);
       send(ws, docSync("undone"));
+      sendHistoryState(ws);
+      return;
+    }
+
+    case "redo": {
+      if (runActive()) {
+        send(ws, { t: "rejected", reason: "A run is in progress." });
+        return;
+      }
+      const snapshot = redoStack.pop();
+      if (!snapshot) {
+        sendHistoryState(ws);
+        return;
+      }
+      undoStack.push(store.snapshot());
+      store.restore(snapshot);
+      send(ws, docSync("redone"));
+      sendHistoryState(ws);
       return;
     }
 
@@ -132,12 +164,7 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         send(ws, { t: "rejected", reason: "A run is in progress." });
         return;
       }
-      // Undo coalescing: capture the snapshot ONLY when none is pending.
-      if (!lastSnapshot) {
-        lastSnapshot = store.snapshot();
-        lastRunVersion = store.version;
-      }
-      humanDirty = true; // a human edit is now pending
+      const before = store.snapshot();
       // args are untrusted `unknown` — dispatch may throw on malformed input.
       let r;
       try {
@@ -150,8 +177,10 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         send(ws, { t: "rejected", reason: `${r.error}: ${r.detail}` });
         return;
       }
+      pushUndoSnapshot(before);
       // Success reuses the ops-applied frame; NO activityId for human edits.
       send(ws, { t: "ops-applied", ops: r.ops, version: r.version });
+      sendHistoryState(ws);
       return;
     }
 
@@ -160,12 +189,9 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         send(ws, { t: "rejected", reason: "A run is already in progress." });
         return;
       }
-      // Capture the pre-run snapshot on the server so undo can restore it. Guarded
-      // so a human edit followed by a run coalesces into one undo level.
-      if (!lastSnapshot || !humanDirty) {
-        lastSnapshot = store.snapshot();
-        lastRunVersion = store.version;
-      }
+      // Capture one pre-run snapshot so the whole agent run is one undo entry.
+      const before = store.snapshot();
+      pushUndoSnapshot(before);
 
       const rc = new RunController();
       activeRC = rc;
@@ -178,10 +204,10 @@ async function handle(ws: WebSocket, msg: ClientMessage): Promise<void> {
         rc.finishEscalated(`Run threw: ${(err as Error).message}`);
       } finally {
         activeRC = null;
-        humanDirty = false; // the run is committed; the next run is its own level
         // Push a definitive doc-sync so the mirror matches the authoritative store
         // exactly (covers any op the mirror missed mid-stream).
         send(ws, docSync("doc-sync"));
+        sendHistoryState(ws);
       }
       return;
     }

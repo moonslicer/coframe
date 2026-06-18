@@ -59,6 +59,11 @@ Design quality defaults:
 
 Rules:
 - ALWAYS act through tools. Do not describe what you would do — call the tool that does it.
+- To BUILD new content (a section, screen, card grid, list, form, header — anything more than ~2 new
+  nodes), strongly prefer ONE composeSubtree call describing the whole nested subtree at once, rather than
+  many createFrame/createText/createShape turns. Think through the entire composition, then emit it in a
+  single call: give each FRAME a layout {dir,gap,padding,align} and its children, with sizes (w,h) and
+  inline styling. This is faster and produces a more coherent result than building node-by-node.
 - Prefer semantic tools (applyAutoLayout, alignDistribute, placeBelow) over raw coordinates.
 - Reference nodes by their exact id from the scene graph or markMap. Never invent an id.
 - When you create a frame, its new id is returned in the ops; use that id to add children on the NEXT turn.
@@ -70,12 +75,18 @@ Rules:
 - If the human has selected NodeIds, those are your targets — operate on exactly that set, not the
   whole canvas.
 - A container is not finished until it HOLDS its requested contents. A new FRAME is only a styled shell
-  until you add the content and layout it needs. So: a button needs its label TEXT created inside it; a card needs the
-  title / price / button the request named; a task row needs its checkbox shape AND its label TEXT; a
-  stat card needs its number AND its caption; an hourly forecast card needs time / condition or icon /
-  temperature; a daily forecast row needs day / condition / high-low. After createFrame for such an
-  element, create those children (createText / createShape into that frame) in the SAME step before
-  you stop.
+  until you add the content and layout it needs. Whatever the domain, fill it with the parts that unit is
+  actually made of — infer them from the element and the requested style, do not leave a created frame
+  empty. For example: a button needs its label TEXT; a card needs its title plus the supporting
+  text/shapes the request implies; a list row needs its leading icon/avatar shape AND its label TEXT; a
+  media tile needs its thumbnail shape, title, and meta line; a stat needs its number AND its label; a
+  nav/tab bar needs its icon shapes. After createFrame for such an element, create those children
+  (createText / createShape into that frame) in the SAME step before you stop.
+- BATCH repeated sets in ONE turn. When a step calls for a SET of similar items — a row of cards, a
+  multi-day list, a grid of tiles, a stack of rows, a set of tabs — emit ALL of them (every frame AND
+  every text/shape inside them) as multiple tool calls in a SINGLE response. Do NOT create one example
+  item and stop: you get only a few turns per step, so one-item-per-turn runs out of budget and ships a
+  half-built section. If the step names a count ("5 cards", "7 days", "8 thumbnails"), produce that many.
 - Use the EXACT words the user specified for a label or title. If they said the title is "Sign In",
   create the text "Sign In", not "Log In" or any paraphrase.
 - If the user named a color for an element (e.g. "a blue button"), set that fill with setFill — a
@@ -145,8 +156,10 @@ const PLAN_TOOL: Anthropic.Tool = {
                 "A machine-checkable post-condition. Pick ONE kind. " +
                 "nodeExists: a child of `parentId` with `type` (and optional `nameLike` substring) exists. " +
                 "childCount: existing `frameId` has AT LEAST `count` direct children (count is a " +
-                "minimum — pick the smallest number that proves the frame is populated, e.g. 2-3 for " +
-                "'a row of cards'; the act model decides the exact number). " +
+                "minimum). When the user NAMES a count for the set ('6 tiles', '7 days', '4 stats', " +
+                "'8 thumbnails'), set `count` to THAT number so a half-built set fails verify and the " +
+                "loop finishes it. Only when NO count is named pick a small lower bound (2-3 for a vague " +
+                "'a row of cards') and let the act model decide the exact number. " +
                 "childCountNamed: like childCount but the frame is RESOLVED BY `parentId`+`type`+`nameLike` — " +
                 "use this to assert the child count of a frame THIS plan creates. " +
                 "prop: live `id`.`path` deep-equals `equals` (e.g. path 'layout.mode' equals 'VERTICAL') — " +
@@ -186,7 +199,7 @@ const PLAN_TOOL: Anthropic.Tool = {
                   description: "nodeExists: optional case-insensitive name substring.",
                 },
                 frameId: { type: "string", description: "childCount: frame NodeId." },
-                count: { type: "number", description: "childCount: MINIMUM child count (>=); pick a small lower bound." },
+                count: { type: "number", description: "childCount: MINIMUM child count (>=). Use the user's NAMED count when given ('6 tiles' -> 6); else a small lower bound (2-3)." },
                 id: { type: "string", description: "prop/belowOf: target NodeId." },
                 path: {
                   type: "string",
@@ -231,6 +244,7 @@ export async function plan(
   rootId: NodeId,
   store: DocStore,
   selection: NodeId[],
+  onUsage?: (u: Usage) => void,
 ): Promise<Step[]> {
   // The planner projects ALL task-relevant fields (layout + style + text) so it can
   // both choose the right tool AND copy concrete values (e.g. a button's fills) into a
@@ -246,7 +260,7 @@ export async function plan(
     `Intent: ${intent}\n\n` +
     selectionLine +
     `Working frame root: ${rootId}\n` +
-    `Current scene graph (scoped):\n${JSON.stringify(tree, null, 2)}\n\n` +
+    `Current scene graph (scoped):\n${JSON.stringify(tree)}\n\n` +
     `Decompose this into an ordered plan. Each step MUST carry a success criterion that asserts the ` +
     `resulting node state (so it can be verified independently of the tools you call). ` +
     `Only the NodeIds listed above exist right now; any node your plan creates has NO id yet, so verify ` +
@@ -257,9 +271,9 @@ export async function plan(
     `typography, spacing, and layout. If no style is named, pick one coherent visual direction that fits the ` +
     `product category.\n\n` +
     `If the intent names an element that should CONTAIN content — a labeled button, a card with a ` +
-    `title/price/button, a row with a checkbox and a label, a stat card with a number and a caption, ` +
-    `an hourly forecast card with time/condition/temperature, or a daily forecast row with ` +
-    `day/condition/high-low — plan ` +
+    `title and supporting detail, a list row with a leading icon/avatar and a label, a stat with a number ` +
+    `and a label, a media tile with a thumbnail/title/meta, or any repeated content unit for the domain at ` +
+    `hand — plan ` +
     `the step(s) that CREATE that inner content and verify the CONTENT (e.g. nodeExists TEXT by nameLike, or ` +
     `childCountNamed on the container), NOT just the container: a frame with no children renders blank. ` +
     `(A request that only aligns, distributes, restyles, or moves EXISTING nodes creates no new content — ` +
@@ -287,6 +301,7 @@ export async function plan(
     (params as any).output_config = { effort: "high" };
 
     const msg = await client().messages.create(params);
+    onUsage?.(readUsage(msg.usage));
     if ((msg.stop_reason as string) === "refusal")
       throw new Error("Planner refused the request.");
 
@@ -338,10 +353,30 @@ export interface ActContext {
   selection?: NodeId[];
 }
 
+/** Per-call token usage, surfaced so the loop can measure the cost of a run. */
+export interface Usage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+}
+
+/** Pull the (possibly cache-augmented) usage off a finished message, defaulting to 0. */
+function readUsage(u: unknown): Usage {
+  const x = (u ?? {}) as Record<string, number | undefined>;
+  return {
+    input: x.input_tokens ?? 0,
+    output: x.output_tokens ?? 0,
+    cacheRead: x.cache_read_input_tokens ?? 0,
+    cacheCreate: x.cache_creation_input_tokens ?? 0,
+  };
+}
+
 export interface ActResult {
   stopReason: string | null;
   toolUses: { id: string; name: string; input: unknown }[];
   text: string;
+  usage: Usage;
 }
 
 // Streamed callback payloads (§4.3 latency levers). The loop turns these into
@@ -367,7 +402,7 @@ export function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
           `acts on "the selected"/"each"/"every"/"all" of them, apply the change to EVERY id ` +
           `listed (one tool call per node); do not stop after the first: ${ctx.selection.join(", ")}\n\n`
         : "") +
-      `Scene graph (scoped, v${ctx.version}):\n${JSON.stringify(ctx.tree, null, 2)}\n\n` +
+      `Scene graph (scoped, v${ctx.version}):\n${JSON.stringify(ctx.tree)}\n\n` +
       `markMap (number -> NodeId): ${JSON.stringify(ctx.markMap)}`,
   });
   if (ctx.image) {
@@ -381,6 +416,48 @@ export function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
     text: "Make the edits for THIS step by calling tools. Then stop.",
   });
   return blocks;
+}
+
+/**
+ * Stale-perception pruner — the single biggest token lever for a multi-turn run.
+ *
+ * Every ACT turn ships a FRESH scene-graph + marked image (the loop re-perceives
+ * before each turn), so the perceptions from PRIOR turns are redundant AND show an
+ * OLDER canvas state — yet they accumulate in `messages` and are re-sent on every
+ * subsequent turn. That is an O(n²) blowup of the most expensive content (a 1024px
+ * PNG is ~1.4k tokens) and it dominates the bill on any heavy multi-section build,
+ * since the cached prefix is only system+tools, not the message history.
+ *
+ * We keep ONLY the latest perception intact and, in every earlier user turn, drop the
+ * stale image and collapse the (now-misleading) scene-graph JSON to a stub. The
+ * tool_use + tool_result pairs — the actual record of what the model did — are left
+ * untouched, so action continuity is fully preserved. Idempotent: re-running on
+ * already-pruned history is a no-op.
+ */
+export function pruneStalePerception(messages: Anthropic.MessageParam[]): void {
+  // Find the last user turn carrying a perception image — that is the one to keep.
+  let keepIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const c = messages[i].content;
+    if (Array.isArray(c) && c.some((b) => (b as { type: string }).type === "image")) {
+      keepIndex = i;
+      break;
+    }
+  }
+  if (keepIndex < 0) return;
+
+  for (let i = 0; i < messages.length; i++) {
+    if (i === keepIndex) continue;
+    const m = messages[i];
+    if (!Array.isArray(m.content)) continue;
+    m.content = m.content.flatMap((b) => {
+      const block = b as { type: string; text?: string };
+      if (block.type === "image") return []; // drop the stale marked render
+      if (block.type === "text" && block.text?.includes("Scene graph (scoped"))
+        return [{ type: "text", text: "[earlier perception elided to save tokens]" } as ContentBlockParam];
+      return [b];
+    });
+  }
 }
 
 /**
@@ -407,8 +484,13 @@ export async function act(
     stream: true,
   };
   // pinned SDK types lag the API: adaptive thinking + effort (cast via any).
+  // ACT runs at `medium` effort, not `high`: the hard reasoning (decomposition, style
+  // direction, criteria) already happened in plan() at high effort, so ACT is the
+  // comparatively mechanical job of emitting the right tool calls for ONE pre-decided
+  // step. Medium cuts thinking/output tokens materially with no observed quality drop on
+  // the probe; the planner stays at high (it drives the whole run's quality).
   (params as any).thinking = { type: "adaptive", display: "summarized" };
-  (params as any).output_config = { effort: "high" };
+  (params as any).output_config = { effort: "medium" };
 
   const stream = client().messages.stream(params);
 
@@ -430,9 +512,11 @@ export async function act(
 
   const msg = await stream.finalMessage();
 
+  const usage = readUsage(msg.usage);
+
   // Branch on stop_reason BEFORE reading content — a refusal is 200 w/ empty content.
   if ((msg.stop_reason as string) === "refusal")
-    return { stopReason: "refusal", toolUses: [], text: "" };
+    return { stopReason: "refusal", toolUses: [], text: "", usage };
 
   let text = "";
   const toolUses: ActResult["toolUses"] = [];
@@ -441,5 +525,5 @@ export async function act(
     else if (block.type === "tool_use")
       toolUses.push({ id: block.id, name: block.name, input: block.input }); // already parsed JSON
   }
-  return { stopReason: msg.stop_reason, toolUses, text };
+  return { stopReason: msg.stop_reason, toolUses, text, usage };
 }

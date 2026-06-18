@@ -4,6 +4,15 @@
 // conflated: the renderer subscribes to docMirror, the chrome to runStore.
 
 import { useEffect, useRef, useState } from "react";
+import {
+  CircleCheck,
+  CircleX,
+  Loader2,
+  Redo2,
+  SendHorizontal,
+  Sparkles,
+  Undo2,
+} from "lucide-react";
 import { Canvas } from "./Canvas.js";
 import { Toolbar } from "./Toolbar.js";
 import { Inspector } from "./Inspector.js";
@@ -29,17 +38,25 @@ export function App() {
   const runActive =
     run.phase !== "IDLE" && run.phase !== "DONE" && run.phase !== "ESCALATED";
 
-  // Cmd-Z / Ctrl-Z -> one-key undo (mic drop). One level; a second is a no-op.
+  // Cmd-Z / Ctrl-Z undo; Cmd-Shift-Z / Ctrl-Shift-Z and Ctrl-Y redo.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
-        if (!runActive && run.canUndo) send({ t: "undo" });
+        if (e.shiftKey) {
+          if (!runActive && run.canRedo) send({ t: "redo" });
+        } else if (!runActive && run.canUndo) {
+          send({ t: "undo" });
+        }
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        if (!runActive && run.canRedo) send({ t: "redo" });
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [runActive, run.canUndo]);
+  }, [runActive, run.canUndo, run.canRedo]);
 
   function submit(prompt: string) {
     const t = prompt.trim();
@@ -49,42 +66,23 @@ export function App() {
   }
 
   return (
-    <div
-      style={{
-        height: "100vh",
-        display: "grid",
-        gridTemplateColumns: "1fr 340px",
-        gridTemplateRows: "auto 1fr auto",
-        gridTemplateAreas: `"header header" "canvas side" "prompt side"`,
-        fontFamily: "Inter, system-ui, sans-serif",
-        background: "#f3f4f6",
-      }}
-    >
-      <header
-        style={{
-          gridArea: "header",
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          padding: "10px 16px",
-          borderBottom: "1px solid #e5e7eb",
-          background: "#fff",
-        }}
-      >
-        <strong>Canvas Agent</strong>
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden>
+            <Sparkles size={16} strokeWidth={2.2} />
+          </span>
+          <div className="brand-copy">
+            <strong>Canvas Agent</strong>
+            <span>Prompt-driven design studio</span>
+          </div>
+        </div>
         <select
+          className="seed-select"
+          aria-label="Seed document"
           value={activeSeed}
           onChange={(e) => send({ t: "loadSeed", seedDocId: e.target.value })}
           disabled={runActive}
-          style={{
-            fontSize: 13,
-            padding: "4px 8px",
-            borderRadius: 6,
-            border: "1px solid #d1d5db",
-            background: runActive ? "#f3f4f6" : "#fff",
-            color: "#111",
-            cursor: runActive ? "default" : "pointer",
-          }}
         >
           {Object.keys(SEEDS).map((id) => (
             <option key={id} value={id}>
@@ -94,43 +92,38 @@ export function App() {
         </select>
         <PhaseBadge phase={run.phase} />
         {run.banner && (
-          <span style={{ color: "#b45309", fontSize: 13 }}>{run.banner}</span>
+          <span className="run-banner">{run.banner}</span>
         )}
-        <button
-          onClick={() => send({ t: "undo" })}
-          disabled={runActive || !run.canUndo}
-          style={{
-            marginLeft: "auto",
-            padding: "6px 12px",
-            borderRadius: 6,
-            border: "1px solid #d1d5db",
-            background: !runActive && run.canUndo ? "#fff" : "#f3f4f6",
-            color: !runActive && run.canUndo ? "#111" : "#9ca3af",
-            cursor: !runActive && run.canUndo ? "pointer" : "default",
-            fontSize: 13,
-          }}
-        >
-          Undo run (⌘Z)
-        </button>
+        <div className="topbar-actions">
+          <button
+            className="icon-button"
+            onClick={() => send({ t: "undo" })}
+            disabled={runActive || !run.canUndo}
+            title="Undo"
+            aria-label="Undo"
+          >
+            <Undo2 size={16} />
+          </button>
+          <button
+            className="icon-button"
+            onClick={() => send({ t: "redo" })}
+            disabled={runActive || !run.canRedo}
+            title="Redo"
+            aria-label="Redo"
+          >
+            <Redo2 size={16} />
+          </button>
+        </div>
       </header>
 
-      <main style={{ gridArea: "canvas", minHeight: 0, position: "relative" }}>
+      <main className="canvas-area">
         <Canvas />
-        <div style={{ position: "absolute", top: 12, left: 12, zIndex: 20 }}>
+        <div className="toolbar-dock">
           <Toolbar />
         </div>
       </main>
 
-      <aside
-        style={{
-          gridArea: "side",
-          borderLeft: "1px solid #e5e7eb",
-          background: "#fff",
-          display: "flex",
-          flexDirection: "column",
-          minHeight: 0,
-        }}
-      >
+      <aside className="side-panel">
         <Section title="Properties">
           <Inspector />
         </Section>
@@ -142,35 +135,16 @@ export function App() {
         </Section>
       </aside>
 
-      <footer
-        style={{
-          gridArea: "prompt",
-          borderTop: "1px solid #e5e7eb",
-          background: "#fff",
-          padding: 12,
-        }}
-      >
+      <footer className="prompt-dock">
         <SelectionChips runActive={runActive} />
-        <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+        <div className="suggestion-row">
           {SUGGESTIONS.map((s) => (
             <button
               key={s}
+              className="suggestion-chip"
               onClick={() => submit(s)}
               disabled={runActive}
               title={s}
-              style={{
-                fontSize: 12,
-                padding: "4px 10px",
-                borderRadius: 999,
-                border: "1px solid #ddd6fe",
-                background: runActive ? "#f3f4f6" : "#f5f3ff",
-                color: runActive ? "#9ca3af" : "#5b21b6",
-                cursor: runActive ? "default" : "pointer",
-                maxWidth: 320,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
             >
               {s}
             </button>
@@ -181,9 +155,10 @@ export function App() {
             e.preventDefault();
             submit(text);
           }}
-          style={{ display: "flex", gap: 8 }}
+          className="prompt-form"
         >
           <input
+            className="prompt-input"
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder={
@@ -192,29 +167,14 @@ export function App() {
                 : "Describe the design edit…"
             }
             disabled={runActive}
-            style={{
-              flex: 1,
-              padding: "10px 12px",
-              borderRadius: 8,
-              border: "1px solid #d1d5db",
-              fontSize: 14,
-              fontFamily: "inherit",
-            }}
           />
           <button
+            className="primary-action"
             type="submit"
             disabled={runActive || !text.trim()}
-            style={{
-              padding: "10px 18px",
-              borderRadius: 8,
-              border: "none",
-              background: runActive || !text.trim() ? "#c4b5fd" : "#7c3aed",
-              color: "#fff",
-              fontWeight: 600,
-              cursor: runActive || !text.trim() ? "default" : "pointer",
-            }}
           >
-            {runActive ? "Running…" : "Send"}
+            {runActive ? <Loader2 size={16} className="spin" /> : <SendHorizontal size={16} />}
+            <span>{runActive ? "Running" : "Send"}</span>
           </button>
         </form>
       </footer>
@@ -231,46 +191,20 @@ function SelectionChips({ runActive }: { runActive: boolean }) {
     (id) => docMirror.store.getNode(id)?.name ?? id,
   );
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-        marginBottom: 8,
-        flexWrap: "wrap",
-        fontSize: 12,
-      }}
-    >
-      <span style={{ color: "#6b7280", fontWeight: 600 }}>
+    <div className="selection-row">
+      <span className="selection-label">
         Targeting {sel.length}:
       </span>
       {names.map((n, i) => (
-        <span
-          key={i}
-          style={{
-            padding: "2px 8px",
-            borderRadius: 999,
-            background: "#eff6ff",
-            color: "#1d4ed8",
-            border: "1px solid #bfdbfe",
-          }}
-        >
+        <span key={i} className="selection-chip">
           {n}
         </span>
       ))}
       <button
+        className="chip-clear"
         onClick={() => {
           docMirror.setSelection([]);
           send({ t: "select", ids: [] });
-        }}
-        style={{
-          marginLeft: 2,
-          padding: "2px 8px",
-          borderRadius: 999,
-          border: "1px solid #e5e7eb",
-          background: "#fff",
-          color: "#6b7280",
-          cursor: "pointer",
         }}
       >
         Clear
@@ -281,19 +215,8 @@ function SelectionChips({ runActive }: { runActive: boolean }) {
 
 function PhaseBadge({ phase }: { phase: string }) {
   const active = phase !== "IDLE" && phase !== "DONE" && phase !== "ESCALATED";
-  const color =
-    phase === "ESCALATED" ? "#b91c1c" : phase === "DONE" ? "#15803d" : "#6d28d9";
   return (
-    <span
-      style={{
-        fontSize: 12,
-        padding: "2px 8px",
-        borderRadius: 999,
-        background: "#f5f3ff",
-        color,
-        fontWeight: 600,
-      }}
-    >
+    <span className={`phase-badge phase-${phase.toLowerCase()}`}>
       {active && <span className="pulse-dot" />} {phase.toLowerCase()}
     </span>
   );
@@ -309,28 +232,9 @@ function Section({
   grow?: boolean;
 }) {
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        flex: grow ? 1 : "none",
-        minHeight: 0,
-        borderBottom: grow ? "none" : "1px solid #f3f4f6",
-      }}
-    >
-      <div
-        style={{
-          padding: "10px 14px 6px",
-          fontSize: 12,
-          fontWeight: 700,
-          color: "#6b7280",
-          textTransform: "uppercase",
-          letterSpacing: 0.5,
-        }}
-      >
-        {title}
-      </div>
-      <div style={{ overflow: "auto", padding: "0 14px 12px", flex: grow ? 1 : "none" }}>
+    <div className={`panel-section${grow ? " panel-section-grow" : ""}`}>
+      <div className="panel-title">{title}</div>
+      <div className="panel-body">
         {children}
       </div>
     </div>
@@ -351,42 +255,27 @@ function ActivityLog({
   }, [activity.length, activity[activity.length - 1]?.status]);
 
   if (!activity.length && phase === "IDLE")
-    return <div style={{ color: "#9ca3af", fontSize: 13 }}>No run yet.</div>;
+    return <div className="empty-state">No run yet.</div>;
   if (!activity.length && phase === "PLANNING")
     return (
-      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-        <li
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "4px 0",
-            fontSize: 13,
-          }}
-        >
+      <ul className="activity-list">
+        <li className="activity-item">
           <span className="pulse-dot" /> Planning…
         </li>
       </ul>
     );
   return (
-    <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+    <ul className="activity-list">
       {activity.map((a) => (
         <li
           key={a.id}
-          style={{
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 8,
-            padding: "4px 0",
-            fontSize: 13,
-            color: a.status === "failed" ? "#b91c1c" : "#111",
-          }}
+          className={`activity-item activity-${a.status}`}
         >
           <StatusIcon status={a.status} />
           <span>
             {a.text}
             {a.status === "failed" && a.detail && (
-              <span style={{ color: "#b91c1c" }}> — couldn’t ({a.detail})</span>
+              <span className="activity-detail"> — couldn’t ({a.detail})</span>
             )}
           </span>
         </li>
@@ -398,38 +287,31 @@ function ActivityLog({
 
 function StatusIcon({ status }: { status: ActivityEntry["status"] }) {
   if (status === "ok")
-    return <span style={{ color: "#15803d", width: 14 }}>✓</span>;
+    return <CircleCheck className="status-icon status-ok" size={14} />;
   if (status === "failed")
-    return <span style={{ color: "#b91c1c", width: 14 }}>✕</span>;
+    return <CircleX className="status-icon status-failed" size={14} />;
   return <span className="pulse-dot" style={{ marginTop: 5 }} />;
 }
 
 function History({ history }: { history: ReturnType<typeof useRunState>["history"] }) {
   if (!history.length)
-    return <div style={{ color: "#9ca3af", fontSize: 13 }}>No runs yet.</div>;
+    return <div className="empty-state">No runs yet.</div>;
   return (
-    <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+    <ul className="history-list">
       {history
         .slice()
         .reverse()
         .map((h, i) => (
           <li
             key={i}
-            style={{
-              padding: "8px 10px",
-              marginBottom: 6,
-              borderRadius: 8,
-              border: "1px solid #e5e7eb",
-              background: h.status === "escalated" ? "#fef2f2" : "#f8fafc",
-              fontSize: 13,
-            }}
+            className={`history-card history-${h.status}`}
           >
-            <div style={{ fontWeight: 600 }}>
+            <div className="history-title">
               {h.status === "escalated" ? "Couldn’t complete" : "Agent: design edit"}
             </div>
-            <div style={{ color: "#6b7280", marginTop: 2 }}>{h.summary}</div>
+            <div className="history-summary">{h.summary}</div>
             {h.status === "done" && (
-              <div style={{ color: "#9ca3af", fontSize: 11, marginTop: 2 }}>
+              <div className="history-meta">
                 v{h.fromVersion} → v{h.toVersion} · ⌘Z to revert
               </div>
             )}

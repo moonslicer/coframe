@@ -46,15 +46,25 @@ function deepEqual(a: unknown, b: unknown): boolean {
 
 const bottom = (n: Node): number => n.bbox[1] + n.bbox[3];
 
-const CONTENT_CONTEXT_RE =
-  /\b(forecast|weather|hourly|daily|card|row|list|button|pricing|tier|task|stat|metric|dashboard|schedule|table)\b/i;
-const PLACEHOLDER_CONTEXT_RE = /\b(placeholder|skeleton|wireframe|empty|outline|lo-fi|low fidelity)\b/i;
+// A low-fidelity / placeholder request WANTS empty frames — do not enforce content
+// there. These words describe FIDELITY, not a domain, so the check stays general.
+const PLACEHOLDER_CONTEXT_RE =
+  /\b(placeholder|skeleton|wireframe|empty|outline|lo-?fi|low[\s-]?fidelity|blank|stub|spacer|divider)\b/i;
 
-function isContentBearingFrameName(name: string, context: string): boolean {
-  const lower = name.toLowerCase();
-  if (/\b(hour\s*\d+|day\s+row|forecast\s+card)\b/.test(lower)) return true;
-  if (/\b(card|button|tier|plan|task|stat|metric|item)\b/.test(lower)) return true;
-  return /\brow\b/.test(lower) && /\b(forecast|daily|hourly|weather|task|list|table|schedule)\b/.test(context);
+// Outer SHELL / scaffold frames are intentionally empty at the step that CREATES them
+// — a later step fills them — so they must NOT be flagged as blank. This denylist is
+// purely STRUCTURAL: it names the container/scaffold words that recur across every
+// design system (a retro arcade menu, a video feed, a photo grid, a settings page all
+// sit inside a "screen"/"page"/"artboard"/"background"), never the content itself.
+// Replacing the old domain-keyword ALLOWlist (forecast/weather/pricing/…): that only
+// recognized the handful of demo domains, so a frame named "Cartridge Slot" or "Video
+// Tile" was never checked and shipped blank. We now treat ANY created content frame as
+// needing content unless its name marks it as a shell.
+const STRUCTURAL_SHELL_RE =
+  /\b(screen|app|page|container|background|backdrop|artboard|canvas|wrapper|shell|root|device|viewport|safe[\s-]?area)\b/i;
+
+function isStructuralShell(name: string): boolean {
+  return STRUCTURAL_SHELL_RE.test(name.toLowerCase());
 }
 
 /** Does this frame hold any VISIBLE content anywhere in its subtree — a non-empty
@@ -97,21 +107,32 @@ export function verifyContentCompleteness(args: {
   originalIds?: ReadonlySet<NodeId>;
 }): VerifyResult {
   const context = `${args.intent} ${args.step.label} ${JSON.stringify(args.step.criterion)}`;
-  if (!CONTENT_CONTEXT_RE.test(context) || PLACEHOLDER_CONTEXT_RE.test(context))
-    return { ok: true, evidence: "content completeness not required" };
+  // The ONLY domain-free reason to skip: the user explicitly asked for a low-fidelity /
+  // placeholder artifact, where empty frames are the point.
+  if (PLACEHOLDER_CONTEXT_RE.test(context))
+    return { ok: true, evidence: "low-fidelity/placeholder request — empty frames are intentional" };
 
   const root = args.store.getNode(args.rootId);
   if (!root) return { ok: true, evidence: `root ${args.rootId} does not exist` };
 
+  // A blank frame is flagged only when it is a CONTENT SECTION of a composition this
+  // run is building — i.e. it sits INSIDE another frame (parent !== the working root),
+  // is newly created, and is not a named structural shell. This structural test (no
+  // domain keywords) catches the "built styled-but-empty section boxes" bug for ANY
+  // design system, while sparing the two legitimate empties: the outer shell created
+  // directly under the root (a LATER step fills it) and a single literal "add a frame"
+  // request (its frame also sits at the root, so it is never required to hold content).
   const candidates: Node[] = [];
   const walk = (id: NodeId) => {
     const node = args.store.getNode(id);
     if (!node) return;
     const isNew = !args.originalIds || !args.originalIds.has(node.id);
+    const isNested = node.parent != null && node.parent !== args.rootId;
     if (
       isNew &&
+      isNested &&
       node.type === "FRAME" &&
-      isContentBearingFrameName(node.name, context) &&
+      !isStructuralShell(node.name) &&
       !hasContentDescendant(args.store, node.id)
     ) {
       candidates.push(node);
@@ -125,7 +146,7 @@ export function verifyContentCompleteness(args: {
     (n) => !hasCandidateDescendant(args.store, n.id, candidateIds),
   );
   if (blankLeafContainers.length === 0)
-    return { ok: true, evidence: "content-bearing frames have text descendants" };
+    return { ok: true, evidence: "created content sections all hold visible content" };
 
   const names = blankLeafContainers
     .slice(0, 6)

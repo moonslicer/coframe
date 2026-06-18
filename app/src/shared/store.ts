@@ -105,6 +105,13 @@ export class DocStore {
   commit(ops: Op[], baseVersion: DocVersion): ToolResult {
     if (baseVersion !== this._version)
       return { error: "STALE", detail: `base ${baseVersion} != ${this._version}` };
+    // Track ids that WILL exist as we walk the batch in order, so an `add` may reference
+    // a parent created EARLIER in the same commit. This is what lets a tool (composeSubtree)
+    // emit a whole nested subtree — frame then its children — in one atomic commit; without
+    // it the child's add would BAD_ID against a parent not yet in `this.nodes`. applyOps
+    // already processes adds in order, so the doc stays consistent. Single-add tool calls
+    // are unaffected: willExist starts as exactly the live key set.
+    const willExist = new Set<NodeId>(this.nodes.keys());
     for (const op of ops) {
       // perception-spec §6: kill hallucinated-id corruption before it mutates the doc
       const ref =
@@ -113,8 +120,9 @@ export class DocStore {
           : "id" in op
             ? op.id
             : null;
-      if (ref && !this.nodes.has(ref))
+      if (ref && !willExist.has(ref))
         return { error: "BAD_ID", detail: `unknown node ${ref}` };
+      if (op.kind === "add") willExist.add(op.node.id);
     }
     this.nodes = applyOps(this.nodes, ops);
     this._version += 1;
