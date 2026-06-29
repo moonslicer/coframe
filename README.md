@@ -1,6 +1,6 @@
 # Agentic Design Canvas
 
-An AI design agent that **perceives and edits a Figma-like vector document**, co-editing
+An AI design agent that **perceives and edits a vector design document**, co-editing
 alongside a human on a shared canvas. Describe a screen in plain English and the agent
 plans, builds, and refines it; then keep editing by hand or by asking for changes.
 
