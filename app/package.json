@@ -2,6 +2,12 @@
   "name": "canvas-agent-app",
   "private": true,
   "version": "0.0.1",
+  "description": "An AI design agent that perceives and edits a Figma-like vector document, co-editing alongside a human on a shared canvas.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moonslicer/design.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n server,client -c magenta,cyan \"npm:server\" \"vite\"",

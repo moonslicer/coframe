@@ -8,7 +8,8 @@ export const meta = {
   ],
 }
 
-const APP = '/Users/hao/Projects/design/app'
+// Resolve the app dir relative to this workflow file (.claude/workflows/ -> app/).
+const APP = new URL('../..', import.meta.url).pathname.replace(/\/$/, '')
 const RUN = `npm --prefix ${APP} run -s session --`
 
 // Realistic apps. Each initial prompt asks for a COMPLETE screen so there are real

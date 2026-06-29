@@ -268,7 +268,7 @@ function DesignSystemPanel({
           onKeyDown={(e) => {
             if (e.key === "Enter") importUrl();
           }}
-          placeholder="file:///Users/hao/Downloads/Haven%20Design%20System.html"
+          placeholder="file:///path/to/your-design-system.html"
           disabled={runActive}
           aria-label="Design system file URL"
         />

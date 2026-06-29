@@ -1,6 +1,10 @@
 # Headless agent loop — "prove the bet first"
 
-The **day 1–2 slice** from [`../IMPLEMENTATION.md`](../IMPLEMENTATION.md): a real
+> **Archived prototype.** This was the earliest standalone proof-of-concept and has
+> been superseded by the full app under [`/app`](../../../app). It is kept here for
+> historical reference only; it is not wired into the main project.
+
+The **day 1–2 slice** from [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md): a real
 Anthropic tool-use loop over a vector scene graph, with **no UI and no rendering**.
 
 It exists to answer the one question the whole project hangs on:
