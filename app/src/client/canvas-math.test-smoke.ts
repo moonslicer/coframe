@@ -3,12 +3,18 @@
 
 import {
   type BBox,
+  type Camera,
   type HandleId,
+  canvasToScreen,
   clientToCanvas,
+  fitCamera,
   handlePositions,
   moveBBox,
   normalizeRect,
+  panCamera,
   resizeBBox,
+  screenToCanvas,
+  zoomAt,
 } from "./canvas-math.js";
 
 let failed = 0;
@@ -186,6 +192,100 @@ const bboxClose = (a: BBox, b: BBox) => a.every((v, i) => close(v, b[i]));
     }
   }
   check("handlePositions places all 8 handles at corners/edge-midpoints", allPlaced);
+}
+
+// --- camera: screenToCanvas(canvasToScreen(p)) === p (round-trip identity)
+{
+  const cam: Camera = { tx: 37, ty: -19, zoom: 0.625 };
+  const rect = { left: 30, top: 70 };
+  const canvasX = 312.5;
+  const canvasY = 88.25;
+  const [sx, sy] = canvasToScreen(canvasX, canvasY, rect, cam);
+  const [rx, ry] = screenToCanvas(sx, sy, rect, cam);
+  check(
+    "camera screenToCanvas inverts canvasToScreen",
+    close(rx, canvasX) && close(ry, canvasY),
+    `got ${rx},${ry}`,
+  );
+}
+
+// --- camera: forward transform matches the hand-derived translate(t) scale(zoom)
+{
+  const cam: Camera = { tx: 40, ty: 10, zoom: 2 };
+  const rect = { left: 30, top: 70 };
+  // screen = left + tx + canvas*zoom ; 30+40+5*2=80 ; 70+10+3*2=86
+  const [sx, sy] = canvasToScreen(5, 3, rect, cam);
+  check("camera canvasToScreen forward maps correctly", close(sx, 80) && close(sy, 86), `got ${sx},${sy}`);
+}
+
+// --- zoomAt invariant: the canvas point under the anchor is unchanged by the zoom
+{
+  const cam: Camera = { tx: 12, ty: -8, zoom: 0.5 };
+  const rect = { left: 30, top: 70 };
+  const ax = 250;
+  const ay = 190;
+  const before = screenToCanvas(ax, ay, rect, cam);
+  const next = zoomAt(cam, 2, ax, ay, rect, 0.1, 8);
+  const after = screenToCanvas(ax, ay, rect, next);
+  check("zoomAt keeps canvas point under cursor fixed", close(after[0], before[0]) && close(after[1], before[1]), `before ${before} after ${after}`);
+  check("zoomAt scales zoom by factor", close(next.zoom, 1), `got ${next.zoom}`);
+  // input camera not mutated
+  check("zoomAt does not mutate input camera", cam.zoom === 0.5 && cam.tx === 12 && cam.ty === -8);
+}
+
+// --- zoomAt respects min/max clamps (cursor still stays fixed at the clamp)
+{
+  const cam: Camera = { tx: 0, ty: 0, zoom: 4 };
+  const rect = { left: 0, top: 0 };
+  const ax = 100;
+  const ay = 100;
+  const clamped = zoomAt(cam, 10, ax, ay, rect, 0.1, 8); // 4*10=40 -> clamp to 8
+  check("zoomAt clamps to maxZoom", close(clamped.zoom, 8), `got ${clamped.zoom}`);
+  const before = screenToCanvas(ax, ay, rect, cam);
+  const after = screenToCanvas(ax, ay, rect, clamped);
+  check("zoomAt keeps cursor fixed even when clamped", close(after[0], before[0]) && close(after[1], before[1]));
+  const lo = zoomAt(cam, 0.001, ax, ay, rect, 0.1, 8); // 4*0.001 -> clamp to 0.1
+  check("zoomAt clamps to minZoom", close(lo.zoom, 0.1), `got ${lo.zoom}`);
+}
+
+// --- panCamera shifts tx/ty by screen pixels, leaves zoom, returns a NEW camera
+{
+  const cam: Camera = { tx: 5, ty: 9, zoom: 0.5 };
+  const panned = panCamera(cam, 20, -10);
+  check("panCamera shifts tx/ty, keeps zoom", close(panned.tx, 25) && close(panned.ty, -1) && close(panned.zoom, 0.5), JSON.stringify(panned));
+  check("panCamera does not mutate input camera", cam.tx === 5 && cam.ty === 9);
+}
+
+// --- fitCamera: bbox center maps to container center, and bbox fits the padded box
+{
+  const bbox: BBox = [100, 200, 400, 300]; // center (300, 350)
+  const container = { width: 800, height: 600 };
+  const pad = 40;
+  const cam = fitCamera(bbox, container, pad, 0.1, 8);
+  // limiting axis: sw=(800-80)/400=1.8 ; sh=(600-80)/300=1.7333 -> zoom=1.7333 (height-limited)
+  check("fitCamera fits the tighter (height) axis", close(cam.zoom, (600 - 2 * pad) / 300), `got ${cam.zoom}`);
+  // center -> container center
+  const [scx, scy] = canvasToScreen(300, 350, { left: 0, top: 0 }, cam);
+  check("fitCamera maps bbox center to container center", close(scx, 400) && close(scy, 300), `got ${scx},${scy}`);
+  // bbox screen extent fits within container minus padding on each axis
+  const wScreen = bbox[2] * cam.zoom;
+  const hScreen = bbox[3] * cam.zoom;
+  check(
+    "fitCamera bbox fits within padded container",
+    wScreen <= container.width - 2 * pad + 1e-9 && hScreen <= container.height - 2 * pad + 1e-9,
+    `extent ${wScreen}x${hScreen}`,
+  );
+}
+
+// --- fitCamera respects clamps: a tiny bbox would over-zoom, but clamps to maxZoom
+{
+  const bbox: BBox = [0, 0, 1, 1];
+  const container = { width: 800, height: 600 };
+  const cam = fitCamera(bbox, container, 40, 0.1, 8);
+  check("fitCamera clamps zoom to maxZoom for tiny bbox", close(cam.zoom, 8), `got ${cam.zoom}`);
+  // even clamped, center still lands at container center
+  const [scx, scy] = canvasToScreen(0.5, 0.5, { left: 0, top: 0 }, cam);
+  check("fitCamera centers even when zoom-clamped", close(scx, 400) && close(scy, 300), `got ${scx},${scy}`);
 }
 
 if (failed) {

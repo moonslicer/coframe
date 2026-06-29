@@ -14,6 +14,8 @@
     "session": "tsx src/agent/design-session.ts",
     "smoke": "tsx src/render/svg-build.test-smoke.ts",
     "smoke:raster": "tsx src/render/raster.test-smoke.ts",
+    "smoke:fidelity": "tsx src/render/fidelity.test-smoke.ts",
+    "smoke:inputs": "tsx src/render/input-flow.test-smoke.ts",
     "smoke:perception": "tsx src/render/perception.test-smoke.ts",
     "smoke:loop": "tsx src/agent/run.test-smoke.ts",
     "smoke:eval": "tsx src/agent/eval.test-smoke.ts",
@@ -23,6 +25,7 @@
     "smoke:server": "tsx src/server/server.test-smoke.ts",
     "smoke:tool": "tsx src/server/tool.test-smoke.ts",
     "smoke:tools": "tsx src/shared/tools.test-smoke.ts",
+    "smoke:bounds": "tsx src/shared/bounds.test-smoke.ts",
     "smoke:toolmode": "tsx src/client/toolmode.test-smoke.ts",
     "smoke:canvas-math": "tsx src/client/canvas-math.test-smoke.ts"
   },
@@ -32,6 +35,7 @@
     "dotenv": "^16.6.1",
     "hono": "^4.12.25",
     "lucide-react": "^0.468.0",
+    "openai": "^6.44.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.21.0"

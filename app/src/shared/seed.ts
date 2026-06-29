@@ -239,11 +239,185 @@ export const BUTTONS_SEED: Seed = {
   ],
 };
 
+// ---------------------------------------------------------------------------
+// Seed 4 — an interactive 2-screen mobile flow. Home → Detail (navigate + back)
+// plus a toggle that reveals a hidden panel. Press Play to click through it; it
+// also gives the agent a known-good in-context example of screen/interaction wiring.
+// ---------------------------------------------------------------------------
+export const FLOW_SEED: Seed = {
+  rootId: "node:page",
+  nodes: [
+    {
+      id: "node:page",
+      type: "FRAME",
+      name: "Page",
+      bbox: [0, 0, 1040, 1024],
+      parent: null,
+      children: ["node:home", "node:detail"],
+      style: { fills: [{ type: "SOLID", color: "#F3F4F6" }] },
+      layout: { mode: "NONE" },
+    },
+
+    // --- Screen A: Home ---
+    {
+      id: "node:home",
+      type: "FRAME",
+      name: "Home",
+      bbox: [80, 80, 390, 844],
+      parent: "node:page",
+      children: ["node:home-title", "node:home-card", "node:home-cta", "node:home-menu", "node:home-menupanel"],
+      screen: true,
+      style: { fills: [{ type: "SOLID", color: "#FFFFFF" }], cornerRadius: 32 },
+      layout: { mode: "NONE" },
+    },
+    {
+      id: "node:home-title",
+      type: "TEXT",
+      name: "Greeting",
+      bbox: [112, 150, 300, 34],
+      parent: "node:home",
+      children: [],
+      text: { chars: "Good morning", fontSize: 26, fontWeight: 700, align: "LEFT", color: "#111827" },
+    },
+    {
+      id: "node:home-card",
+      type: "FRAME",
+      name: "Featured Card",
+      bbox: [112, 210, 326, 180],
+      parent: "node:home",
+      children: ["node:home-card-label"],
+      style: { fills: [{ type: "SOLID", color: "#EEF2FF" }], cornerRadius: 16 },
+      layout: { mode: "NONE" },
+    },
+    {
+      id: "node:home-card-label",
+      type: "TEXT",
+      name: "Card Label",
+      bbox: [132, 240, 260, 26],
+      parent: "node:home-card",
+      children: [],
+      text: { chars: "Featured today", fontSize: 18, fontWeight: 600, align: "LEFT", color: "#3730A3" },
+    },
+    {
+      id: "node:home-cta",
+      type: "FRAME",
+      name: "View Details Button",
+      bbox: [112, 560, 326, 56],
+      parent: "node:home",
+      children: ["node:home-cta-label"],
+      style: { fills: [{ type: "SOLID", color: "#4F46E5" }], cornerRadius: 12 },
+      layout: { mode: "NONE" },
+      interactions: [{ trigger: "click", action: "navigate", target: "node:detail" }],
+    },
+    {
+      id: "node:home-cta-label",
+      type: "TEXT",
+      name: "CTA Label",
+      bbox: [112, 577, 326, 22],
+      parent: "node:home-cta",
+      children: [],
+      text: { chars: "View details", fontSize: 16, fontWeight: 600, align: "CENTER", color: "#FFFFFF" },
+    },
+    {
+      id: "node:home-menu",
+      type: "FRAME",
+      name: "Toggle Menu Button",
+      bbox: [112, 632, 326, 52],
+      parent: "node:home",
+      children: ["node:home-menu-label"],
+      style: { fills: [{ type: "SOLID", color: "#F3F4F6" }], cornerRadius: 12 },
+      layout: { mode: "NONE" },
+      interactions: [{ trigger: "click", action: "toggle", target: "node:home-menupanel" }],
+    },
+    {
+      id: "node:home-menu-label",
+      type: "TEXT",
+      name: "Menu Label",
+      bbox: [132, 648, 260, 20],
+      parent: "node:home-menu",
+      children: [],
+      text: { chars: "Toggle menu", fontSize: 15, fontWeight: 500, align: "LEFT", color: "#374151" },
+    },
+    {
+      id: "node:home-menupanel",
+      type: "FRAME",
+      name: "Hidden Menu Panel",
+      bbox: [112, 700, 326, 110],
+      parent: "node:home",
+      children: ["node:home-menupanel-label"],
+      hidden: true,
+      style: { fills: [{ type: "SOLID", color: "#111827" }], cornerRadius: 12 },
+      layout: { mode: "NONE" },
+    },
+    {
+      id: "node:home-menupanel-label",
+      type: "TEXT",
+      name: "Panel Label",
+      bbox: [132, 724, 286, 20],
+      parent: "node:home-menupanel",
+      children: [],
+      text: { chars: "Hidden menu revealed!", fontSize: 14, fontWeight: 500, align: "LEFT", color: "#FFFFFF" },
+    },
+
+    // --- Screen B: Detail ---
+    {
+      id: "node:detail",
+      type: "FRAME",
+      name: "Detail",
+      bbox: [550, 80, 390, 844],
+      parent: "node:page",
+      children: ["node:detail-back", "node:detail-title", "node:detail-body"],
+      screen: true,
+      style: { fills: [{ type: "SOLID", color: "#FFFFFF" }], cornerRadius: 32 },
+      layout: { mode: "NONE" },
+    },
+    {
+      id: "node:detail-back",
+      type: "FRAME",
+      name: "Back Button",
+      bbox: [566, 120, 120, 40],
+      parent: "node:detail",
+      children: ["node:detail-back-label"],
+      style: { fills: [{ type: "SOLID", color: "#F3F4F6" }], cornerRadius: 8 },
+      layout: { mode: "NONE" },
+      interactions: [{ trigger: "click", action: "back" }],
+    },
+    {
+      id: "node:detail-back-label",
+      type: "TEXT",
+      name: "Back Label",
+      bbox: [582, 131, 90, 20],
+      parent: "node:detail-back",
+      children: [],
+      text: { chars: "← Back", fontSize: 15, fontWeight: 600, align: "LEFT", color: "#374151" },
+    },
+    {
+      id: "node:detail-title",
+      type: "TEXT",
+      name: "Detail Title",
+      bbox: [566, 200, 300, 34],
+      parent: "node:detail",
+      children: [],
+      text: { chars: "Details", fontSize: 26, fontWeight: 700, align: "LEFT", color: "#111827" },
+    },
+    {
+      id: "node:detail-body",
+      type: "TEXT",
+      name: "Detail Body",
+      bbox: [566, 250, 326, 24],
+      parent: "node:detail",
+      children: [],
+      text: { chars: "You navigated here.", fontSize: 16, fontWeight: 400, align: "LEFT", color: "#4B5563" },
+    },
+  ],
+};
+
 // The registry. Seeds are loadable by id; the client picks chips by the active id.
 export const SEEDS: Record<string, Seed> = {
   landing: LANDING_SEED,
   scattered: SCATTERED_SEED,
   buttons: BUTTONS_SEED,
+  flow: FLOW_SEED,
 };
 
 export const DEFAULT_SEED_ID = "landing";
@@ -273,5 +447,9 @@ export const SEED_PROMPTS: Record<string, string[]> = {
   buttons: [
     "Make the three buttons match the primary one and even out the spacing.",
     "Lay the three buttons out in a row with even spacing.",
+  ],
+  flow: [
+    "Add a Profile screen and wire the menu to navigate to it.",
+    "Build a 3-screen onboarding flow with working Next buttons.",
   ],
 };

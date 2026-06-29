@@ -6,6 +6,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildSvg } from "../render/svg-build.js";
+import { contentBounds } from "../shared/store.js";
 import type { NodeId } from "../shared/types.js";
 import {
   docMirror,
@@ -19,19 +20,30 @@ import {
 import { send, sendTool } from "./ws.js";
 import {
   type BBox,
+  type Camera,
   type HandleId,
-  clientToCanvas,
+  fitCamera,
   handlePositions,
   moveBBox,
   normalizeRect,
+  panCamera,
   resizeBBox,
+  screenToCanvas,
+  zoomAt,
 } from "./canvas-math.js";
 
 const MARKS_FLASH_MS = 2600; // float briefly, then dock to the corner thumbnail
 const DRAG_THRESHOLD = 3; // screen px before a press becomes a move/resize (plain click still selects)
 const MIN_SIZE = 4; // minimum node w/h a resize may produce, in canvas px
-const HANDLE_PX = 8; // on-screen handle size; divided by `fit` so it stays constant
+const HANDLE_PX = 8; // on-screen handle size; divided by zoom so it stays constant
 const REPARENT_ECHO_TIMEOUT_MS = 1500; // wait this long for the setBBox echo before bailing
+
+// Interactive camera limits + fit breathing room (all CLIENT-only view state).
+const MIN_ZOOM = 0.05;
+const MAX_ZOOM = 8;
+const FIT_PADDING = 48;
+// The hand/pan tool's ToolMode value (the Hand button in the toolbar).
+const PAN_TOOL: ToolMode = "clickthrough";
 
 // Default node size for a bare click (no rubber-band drag) in each create tool,
 // anchored at the click point. Tuned so a single tap drops a usable element.
@@ -72,7 +84,8 @@ type Gesture =
       startY: number;
       startClientX: number;
       startClientY: number;
-      orig: Map<NodeId, BBox>; // original bboxes of every affected node
+      orig: Map<NodeId, BBox>; // original bboxes of every MOVED node (selection + descendants)
+      selIds: NodeId[]; // the SELECTED ids (drives reparent: only single-select moves reparent)
       dragging: boolean; // crossed the threshold yet?
       reparentTarget: NodeId | null; // valid drop-into FRAME under cursor (single-select moves only)
     }
@@ -99,6 +112,11 @@ type Gesture =
       parent: NodeId;
       points: Array<[number, number]>; // canvas-space points until committed
       preview: VectorPreview | null;
+    }
+  | {
+      // View-only camera pan (hand tool or held Space): drags the camera, never the
+      // doc. Pans imperatively via e.movementX/Y on pointermove — no doc preview.
+      kind: "pan";
     };
 
 interface VectorPreview {
@@ -125,10 +143,10 @@ export function Canvas() {
   const run = useRunState();
   const toolMode = useToolMode(); // active create tool (drives the crosshair cursor)
   const [flashMarks, setFlashMarks] = useState(false);
+  // The container is the STABLE element: its content-box origin coincides with the
+  // stage origin (padding:0), so all screen<->canvas math measures against THIS rect,
+  // never the stage (which moves under the camera transform).
   const containerRef = useRef<HTMLDivElement>(null);
-  // The transform:scale(fit) STAGE div — its getBoundingClientRect() already reflects
-  // the scale and centering, so clientToCanvas divides by `fit` against THIS rect.
-  const stageRef = useRef<HTMLDivElement>(null);
   // The live gesture lives in a ref (not state): pointermove fires faster than React
   // re-renders, and we drive the preview imperatively via docMirror, not via setState.
   const gestureRef = useRef<Gesture | null>(null);
@@ -139,6 +157,31 @@ export function Canvas() {
   const [createRect, setCreateRect] = useState<BBox | null>(null);
   const [vectorPreview, setVectorPreview] = useState<VectorPreview | null>(null);
   const [reparentTarget, setReparentTarget] = useState<NodeId | null>(null);
+
+  // Interactive camera — CLIENT-ONLY view state in the Phase-2 ABSOLUTE convention
+  // (screen = rect.left + tx + canvasCoord*zoom). It is NEVER fed into perception /
+  // buildSvg: the agent's eye is the unscaled, unpanned composition. Mirrored into a
+  // ref so non-React wheel/pointer handlers read the live camera without stale closures.
+  const [cam, setCam] = useState<Camera>({ tx: 0, ty: 0, zoom: 1 });
+  const camRef = useRef(cam);
+  useEffect(() => {
+    camRef.current = cam;
+  }, [cam]);
+  // True once the user has taken manual control of the camera (pan/zoom). While false,
+  // the camera auto-fits content (mount/resize/scene-switch); once true, resize and
+  // layout-settle no longer stomp the user's view. fitToContent() resets it to false.
+  const userMovedCam = useRef(false);
+  // Every user-driven camera change goes through this so resize/auto-fit won't override it.
+  function moveCamera(next: Camera) {
+    userMovedCam.current = true;
+    setCam(next);
+  }
+  // Held-Space pans regardless of the active tool (standard canvas affordance).
+  const [spaceDown, setSpaceDown] = useState(false);
+  const spaceRef = useRef(false);
+  // The seed we last auto-fitted to: we re-fit ONLY on an actual scene change, never
+  // on version bumps (which would reset the user's pan/zoom on every agent edit).
+  const lastFitSeed = useRef<string | null>(null);
 
   // Selection lives in the single doc-mirror source (drives this layer, the prompt
   // placeholder, and the id set shipped with the prompt) — never a local copy.
@@ -153,26 +196,50 @@ export function Canvas() {
     [version],
   );
 
-  // Fit-to-content: scale the stage so the active seed's page frames reasonably,
-  // regardless of its bbox (landing/scattered/buttons differ). NO pan/zoom — just a
-  // single computed scale that re-fits on container resize and seed change.
-  const [fit, setFit] = useState(1);
+  // Frame ALL content in the container with breathing room, centered. The fit/reset
+  // primitive — used on mount, container resize, scene switch, and the Fit button.
+  // Returns true once it actually fit (container measured + content non-empty) so the
+  // seed-gate below only latches after a real fit — otherwise the first (empty-store,
+  // pre-sync) pass would consume the gate and the loaded doc would never auto-fit.
+  function fitToContent(): boolean {
+    const el = containerRef.current;
+    if (!el) return false;
+    const bbox = contentBounds(docMirror.store, docMirror.store.rootId);
+    if (!bbox[2] || !bbox[3]) return false;
+    setCam(
+      fitCamera(
+        bbox,
+        { width: el.clientWidth, height: el.clientHeight },
+        FIT_PADDING,
+        MIN_ZOOM,
+        MAX_ZOOM,
+      ),
+    );
+    userMovedCam.current = false; // fit IS the framed baseline — resize may re-fit again
+    return true;
+  }
+
+  // Auto-fit on initial mount (after the container is measured), on container resize,
+  // and on scene switch (seedDocId change) — but NEVER on version bumps, so an agent
+  // edit mid-run preserves the user's pan/zoom. We re-fit only when the seed actually
+  // changes (tracked in lastFitSeed); the ResizeObserver re-fits on container resize.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const recompute = () => {
-      const [, , vw, vh] = viewBoxDims();
-      if (!vw || !vh) return;
-      const padding = 48; // breathing room inside the viewport
-      const sw = (el.clientWidth - padding) / vw;
-      const sh = (el.clientHeight - padding) / vh;
-      // Never upscale past 1:1 (keeps text crisp); fit to the tighter axis.
-      setFit(Math.max(0.1, Math.min(1, sw, sh)));
-    };
-    recompute();
-    const ro = new ResizeObserver(recompute);
+    const ro = new ResizeObserver(() => {
+      if (!userMovedCam.current) fitToContent();
+    });
     ro.observe(el);
     return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (lastFitSeed.current === docMirror.seedDocId) return;
+    // Latch the seed only when the fit actually lands (content is loaded), so a pre-sync
+    // empty-store pass doesn't consume the gate and suppress the real auto-fit.
+    if (fitToContent()) lastFitSeed.current = docMirror.seedDocId;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [version]);
 
   // Flash the marks overlay when a fresh marks beat arrives (PERCEIVING).
@@ -196,11 +263,11 @@ export function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run.marks?.at, version]);
 
-  // Map a client point to canvas coords against the SCALED stage rect + viewBox origin.
+  // Map a client point to canvas coords via the live camera, measured against the
+  // STABLE container rect (the stage moves under the transform, so it can't be used).
   function toCanvas(clientX: number, clientY: number): [number, number] {
-    const rect = stageRef.current?.getBoundingClientRect() ?? { left: 0, top: 0 };
-    const [vx, vy] = viewBoxDims();
-    return clientToCanvas(clientX, clientY, rect, fit, vx, vy);
+    const rect = containerRef.current?.getBoundingClientRect() ?? { left: 0, top: 0 };
+    return screenToCanvas(clientX, clientY, rect, camRef.current);
   }
 
   // Resolve a no-drag press into a selection change (the OLD onClick logic verbatim).
@@ -232,7 +299,8 @@ export function Canvas() {
       if (!node) return null;
       const id = node.getAttribute("data-node-id") as NodeId | null;
       if (id) {
-        if (!exclude?.has(id) && docMirror.store.getNode(id)?.type === "FRAME") return id;
+        const t = docMirror.store.getNode(id)?.type;
+        if (!exclude?.has(id) && (t === "FRAME" || t === "GROUP")) return id;
         // Not a (valid) frame — keep climbing from this node's parent.
         cur = node.parentElement;
         continue;
@@ -247,6 +315,56 @@ export function Canvas() {
     into.add(id);
     const n = docMirror.store.getNode(id);
     if (n) for (const c of n.children) subtreeIds(c, into);
+  }
+
+  function isLayoutDropTarget(id: NodeId | null): boolean {
+    if (!id) return false;
+    const mode = docMirror.store.getNode(id)?.layout?.mode;
+    return mode === "HORIZONTAL" || mode === "VERTICAL";
+  }
+
+  function nodeDepth(id: NodeId): number {
+    let depth = 0;
+    let cur = docMirror.store.getNode(id)?.parent ?? null;
+    while (cur) {
+      depth += 1;
+      cur = docMirror.store.getNode(cur)?.parent ?? null;
+    }
+    return depth;
+  }
+
+  // Resolve a drop target by geometry, not by the pointer event's DOM target. During
+  // a drag, pointer capture and the moving preview often make the event target the
+  // dragged node/canvas, so DOM hit-testing misses the frame underneath the cursor.
+  function frameAtPoint(cx: number, cy: number, exclude?: Set<NodeId>): NodeId | null {
+    let best: { id: NodeId; depth: number; area: number } | null = null;
+    for (const n of docMirror.store.all().values()) {
+      if (exclude?.has(n.id)) continue;
+      if (n.type !== "FRAME" && n.type !== "GROUP") continue;
+      const [x, y, w, h] = n.bbox;
+      if (cx < x || cy < y || cx > x + w || cy > y + h) continue;
+      const candidate = { id: n.id, depth: nodeDepth(n.id), area: w * h };
+      if (
+        !best ||
+        candidate.depth > best.depth ||
+        (candidate.depth === best.depth && candidate.area < best.area)
+      ) {
+        best = candidate;
+      }
+    }
+    return best?.id ?? null;
+  }
+
+  // Is any ANCESTOR of `id` in the selection? Used so a press inside a selected
+  // group/frame drags the whole group (its children have rects; the group itself
+  // may render nothing, so the hit-test lands on a child).
+  function ancestorSelected(id: NodeId, sel: NodeId[]): boolean {
+    let cur = docMirror.store.getNode(id)?.parent ?? null;
+    while (cur) {
+      if (sel.includes(cur)) return true;
+      cur = docMirror.store.getNode(cur)?.parent ?? null;
+    }
+    return false;
   }
 
   function normalizeVector(tool: VectorTool, points: Array<[number, number]>): VectorPreview {
@@ -298,11 +416,23 @@ export function Canvas() {
   function onPointerDown(e: React.PointerEvent) {
     if (runActive) return; // all gestures disabled mid-run (single-writer guard)
     const el = e.target as Element;
+    // The zoom-control lives inside this container; without this guard our
+    // setPointerCapture below would swallow the buttons' click events.
+    if (el.closest(".zoom-control")) return;
     const cur = docMirror.selection;
 
-    // 0) Non-select tools are either inert click-through, box creation, or vector
-    //    point capture. The parent is the deepest FRAME under the START point.
     const tool = getToolMode();
+
+    // 0a) Camera pan: the hand/pan tool OR held Space. View-only, never touches the
+    //     doc — just drags the camera on pointermove. Takes precedence over all else.
+    if (tool === PAN_TOOL || spaceRef.current) {
+      gestureRef.current = { kind: "pan" };
+      (e.currentTarget as Element).setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // 0b) Non-select tools are either box creation or vector point capture. The parent
+    //     is the deepest FRAME under the START point.
     if (tool === "clickthrough") return;
     if (BOX_TOOLS.has(tool)) {
       const [sx, sy] = toCanvas(e.clientX, e.clientY);
@@ -355,6 +485,7 @@ export function Canvas() {
           startClientX: e.clientX,
           startClientY: e.clientY,
           orig: new Map([[n.id, n.bbox as BBox]]),
+          selIds: [n.id],
           dragging: false,
           reparentTarget: null,
         };
@@ -367,9 +498,16 @@ export function Canvas() {
     const nodeEl = el.closest("[data-node-id]");
     const nodeId = nodeEl?.getAttribute("data-node-id") as NodeId | null;
     const hit = nodeId && nodeId !== docMirror.store.rootId ? nodeId : null;
-    if (hit && cur.includes(hit)) {
+    // Drag the SELECTION when the press lands on a selected node OR on a descendant of
+    // one (so clicking inside a selected group moves the whole group, Figma-style).
+    if (hit && (cur.includes(hit) || ancestorSelected(hit, cur))) {
+      // Move the selection AND every descendant together, so dragging a frame/group
+      // carries its contents (positions are absolute — a parent doesn't move children
+      // on its own). The map dedups, so a selected parent+child translate exactly once.
       const orig = new Map<NodeId, BBox>();
-      for (const id of cur) {
+      const ids = new Set<NodeId>();
+      for (const id of cur) subtreeIds(id, ids);
+      for (const id of ids) {
         const n = docMirror.store.getNode(id);
         if (n) orig.set(id, n.bbox as BBox);
       }
@@ -382,6 +520,7 @@ export function Canvas() {
         startClientX: e.clientX,
         startClientY: e.clientY,
         orig,
+        selIds: [...cur],
         dragging: false,
         reparentTarget: null,
       };
@@ -403,6 +542,12 @@ export function Canvas() {
   function onPointerMove(e: React.PointerEvent) {
     const g = gestureRef.current;
     if (!g || runActive) return;
+
+    if (g.kind === "pan") {
+      // Drag the camera by the raw screen-pixel delta (view-only; no doc preview).
+      moveCamera(panCamera(camRef.current, e.movementX, e.movementY));
+      return;
+    }
 
     const movedPx =
       Math.abs(e.clientX - g.startClientX) + Math.abs(e.clientY - g.startClientY);
@@ -455,13 +600,13 @@ export function Canvas() {
       // cursor that is a VALID new parent — not the node itself, not its descendants,
       // not its current parent. Multi-select moves never reparent.
       let target: NodeId | null = null;
-      if (g.orig.size === 1) {
-        const draggedId = [...g.orig.keys()][0];
+      if (g.selIds.length === 1) {
+        const draggedId = g.selIds[0];
         const dragged = docMirror.store.getNode(draggedId);
         const exclude = new Set<NodeId>();
         subtreeIds(draggedId, exclude); // self + descendants (mirrors the server cycle guard)
-        if (dragged?.parent) exclude.add(dragged.parent); // already there → no-op move
-        target = frameUnder(e.target as Element, exclude);
+        target = frameAtPoint(cx, cy, exclude);
+        if (target === dragged?.parent && !isLayoutDropTarget(target)) target = null;
       }
       if (target !== g.reparentTarget) {
         g.reparentTarget = target;
@@ -483,6 +628,8 @@ export function Canvas() {
       /* capture may already be gone */
     }
     if (!g || runActive) return;
+
+    if (g.kind === "pan") return; // view-only; nothing to commit
 
     if (g.kind === "create") {
       // Compute the new node's bbox: the rubber-band rect, or a sensible default size
@@ -534,8 +681,7 @@ export function Canvas() {
     if (!g.dragging) {
       // A press on a selected node that never moved past the threshold → treat as a
       // plain click that re-selects just that node (matching single-click behavior).
-      const id = [...g.orig.keys()][0];
-      if (g.kind === "move") resolveSelectClick(id ?? null, false);
+      if (g.kind === "move") resolveSelectClick(g.selIds[0] ?? null, false);
       return;
     }
 
@@ -554,14 +700,16 @@ export function Canvas() {
     }
     if (bboxes.length) sendTool("setBBoxes", { items: bboxes });
 
-    // Drag-to-reparent: a single node dropped into a valid new frame. We must send
-    // setBBoxes FIRST (above), then reparent — but reparent's baseVersion would be
-    // STALE if we fired it immediately, because sendTool reads docMirror.version,
-    // which only advances when the server echoes the setBBoxes. So we AWAIT the echo
+    // Drag-to-reparent: a single SELECTED node dropped into a valid new frame/group.
+    // (bboxes may carry descendants too, but only the selected node reparents.) We must
+    // send setBBoxes FIRST (above), then reparent — but reparent's baseVersion would be
+    // STALE if we fired it immediately, because sendTool reads docMirror.version, which
+    // only advances when the server echoes the setBBoxes. So we AWAIT the echo
     // (docMirror.nextOpsApplied) before sending reparent, racing it against a timeout
     // so a missing echo can't hang the gesture — on timeout we skip and resync.
-    if (target && bboxes.length === 1) {
-      const id = bboxes[0].id;
+    const selId = g.kind === "move" ? g.selIds[0] : null;
+    if (target && selId) {
+      const id = selId;
       const echoed = Symbol("echoed");
       const timedOut = Symbol("timedout");
       Promise.race([
@@ -571,12 +719,176 @@ export function Canvas() {
         ),
       ]).then((winner) => {
         if (winner === echoed) {
-          sendTool("reparentNodes", { id, parent: target }); // fresh baseVersion now
+          const parent = docMirror.store.getNode(id)?.parent ?? null;
+          if (isLayoutDropTarget(target)) {
+            sendTool("snapIntoLayout", { id, parent: target }); // fresh baseVersion now
+          } else if (target !== parent) {
+            sendTool("reparentNodes", { id, parent: target }); // fresh baseVersion now
+          }
         } else {
           send({ t: "resync" }); // echo never arrived → re-anchor to authoritative truth
         }
       });
     }
+  }
+
+  // Wheel: ctrl/meta held → zoom-to-cursor; otherwise two-axis pan. Attached
+  // imperatively with {passive:false} so we can preventDefault the browser's
+  // page-zoom / scroll. Reads the live camera + container rect via refs.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      if (e.ctrlKey || e.metaKey) {
+        // Pinch-zoom / ctrl+wheel → zoom about the cursor. deltaY<0 zooms in.
+        const factor = Math.exp(-e.deltaY * 0.01);
+        moveCamera(zoomAt(camRef.current, factor, e.clientX, e.clientY, rect, MIN_ZOOM, MAX_ZOOM));
+      } else {
+        // Plain wheel / trackpad scroll → pan (natural direction).
+        moveCamera(panCamera(camRef.current, -e.deltaX, -e.deltaY));
+      }
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // Track held Space (enables temporary pan over any tool). Mirrored to a ref so the
+  // pointerdown handler reads it live. Ignored while typing so Space in the prompt box
+  // is unaffected, and skipped mid-run.
+  useEffect(() => {
+    function isTyping() {
+      const ae = document.activeElement;
+      const tag = ae?.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        (ae as HTMLElement | null)?.isContentEditable === true
+      );
+    }
+    function onDown(e: KeyboardEvent) {
+      if (e.code === "Space" && !isTyping() && !runActive) {
+        spaceRef.current = true;
+        setSpaceDown(true);
+      }
+    }
+    function onUp(e: KeyboardEvent) {
+      if (e.code === "Space") {
+        spaceRef.current = false;
+        setSpaceDown(false);
+      }
+    }
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+    };
+  }, [runActive]);
+
+  // Camera keyboard shortcuts. GUARDED to ignore keystrokes while typing in an
+  // INPUT/TEXTAREA/contentEditable so the prompt box is unaffected. These are
+  // view-only: none of them mutate the doc or flow into perception.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const ae = document.activeElement;
+      const tag = ae?.tagName;
+      const typing =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        (ae as HTMLElement | null)?.isContentEditable;
+      if (typing) return;
+      const el = containerRef.current;
+      const center = (): { x: number; y: number; rect: DOMRect } | null => {
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, rect };
+      };
+
+      // Shift+1 → fit all content.
+      if (e.key === "!" || (e.shiftKey && e.key === "1")) {
+        e.preventDefault();
+        fitToContent();
+        return;
+      }
+      // Shift+2 → fit the current selection (no-op on empty selection).
+      if (e.key === "@" || (e.shiftKey && e.key === "2")) {
+        e.preventDefault();
+        const sel = docMirror.selection;
+        if (!sel.length || !el) return;
+        let minX = Infinity,
+          minY = Infinity,
+          maxX = -Infinity,
+          maxY = -Infinity;
+        for (const id of sel) {
+          const n = docMirror.store.getNode(id);
+          if (!n) continue;
+          const [x, y, w, h] = n.bbox;
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x + w > maxX) maxX = x + w;
+          if (y + h > maxY) maxY = y + h;
+        }
+        if (minX === Infinity) return;
+        moveCamera(
+          fitCamera(
+            [minX, minY, maxX - minX, maxY - minY],
+            { width: el.clientWidth, height: el.clientHeight },
+            FIT_PADDING,
+            MIN_ZOOM,
+            MAX_ZOOM,
+          ),
+        );
+        return;
+      }
+      // Cmd/Ctrl+0 → reset zoom to exactly 1, about the container center.
+      if ((e.metaKey || e.ctrlKey) && e.key === "0") {
+        e.preventDefault();
+        const c = center();
+        if (!c) return;
+        moveCamera(
+          zoomAt(camRef.current, 1 / camRef.current.zoom, c.x, c.y, c.rect, MIN_ZOOM, MAX_ZOOM),
+        );
+        return;
+      }
+      // "=" / "+" → zoom in step; "-" → zoom out step, both about the center.
+      if (!e.metaKey && !e.ctrlKey && (e.key === "=" || e.key === "+")) {
+        e.preventDefault();
+        const c = center();
+        if (!c) return;
+        moveCamera(zoomAt(camRef.current, 1.2, c.x, c.y, c.rect, MIN_ZOOM, MAX_ZOOM));
+        return;
+      }
+      if (!e.metaKey && !e.ctrlKey && e.key === "-") {
+        e.preventDefault();
+        const c = center();
+        if (!c) return;
+        moveCamera(zoomAt(camRef.current, 1 / 1.2, c.x, c.y, c.rect, MIN_ZOOM, MAX_ZOOM));
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Step-zoom about the container center — shared by the +/- UI buttons.
+  function zoomStep(factor: number) {
+    const el = containerRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    moveCamera(
+      zoomAt(
+        camRef.current,
+        factor,
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2,
+        rect,
+        MIN_ZOOM,
+        MAX_ZOOM,
+      ),
+    );
   }
 
   // Escape cancels an in-flight drag: restore the originals locally, send nothing.
@@ -605,16 +917,39 @@ export function Canvas() {
           return;
         }
       }
+      const ae = document.activeElement;
+      const tag = ae?.tagName;
+      const typing =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        (ae as HTMLElement | null)?.isContentEditable;
+      if (typing) return;
+
+      // ⌘G / Ctrl-G groups the current selection into a new GROUP; ⌘⇧G / Ctrl-⇧G
+      // dissolves a selected GROUP back into its parent.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "g") {
+        e.preventDefault();
+        const sel = docMirror.selection;
+        if (e.shiftKey) {
+          if (sel.length === 1) {
+            const n = docMirror.store.getNode(sel[0]);
+            if (n?.type === "GROUP" && n.children.length) {
+              const kids = [...n.children];
+              sendTool("ungroupNodes", { id: sel[0] });
+              docMirror.setSelection(kids); // ids survive the hoist → keep them selected
+              send({ t: "select", ids: kids });
+            }
+          }
+        } else if (sel.length >= 1) {
+          docMirror.selectNextAdded(); // select the new group on the server echo
+          sendTool("groupNodes", { ids: sel });
+        }
+        return;
+      }
+
       if (e.key === "Delete" || e.key === "Backspace") {
         const sel = docMirror.selection;
         if (!sel.length) return;
-        const ae = document.activeElement;
-        const tag = ae?.tagName;
-        const typing =
-          tag === "INPUT" ||
-          tag === "TEXTAREA" ||
-          (ae as HTMLElement | null)?.isContentEditable;
-        if (typing) return;
         e.preventDefault();
         sendTool("deleteNodes", { ids: sel });
         docMirror.clearSelection();
@@ -623,6 +958,14 @@ export function Canvas() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [runActive]);
+
+  // Reconcile the Phase-2 ABSOLUTE camera with the overlays' viewBox origin: each
+  // overlay (and the injected SVG) draws a canvas point (cx,cy) at element-local pixel
+  // (cx - vx, cy - vy). So the stage transform must ADD BACK the viewBox origin scaled
+  // by zoom, on top of the camera translate, to land the same canvas point on screen.
+  const [vx, vy] = viewBoxDims();
+  // The grab affordance shows whenever a pan is available (hand tool or held Space).
+  const panning = !runActive && (toolMode === PAN_TOOL || spaceDown);
 
   return (
     <div
@@ -635,62 +978,79 @@ export function Canvas() {
         width: "100%",
         height: "100%",
         overflow: "hidden",
-        display: "flex",
-        justifyContent: "center",
-        alignItems: "center",
-        padding: 24,
+        padding: 0,
         boxSizing: "border-box",
-        cursor:
-          runActive || toolMode === "clickthrough"
-            ? "default"
+        cursor: runActive
+          ? "default"
+          : panning
+            ? "grab"
             : toolMode !== "select"
               ? "crosshair"
               : "pointer",
       }}
     >
-      {/* Sizing box reserves the SCALED footprint so the transform-scaled stage
-          centers without spurious scrollbars; overlays live inside, so they scale
-          and stay pixel-aligned to the injected SVG. */}
+      {/* The transform-scaled/translated STAGE: fills from the container origin so the
+          container rect (stable) maps cleanly to canvas coords. The injected SVG +
+          overlays live inside, so they pan/zoom together and stay pixel-aligned. */}
       <div
         style={{
-          position: "relative",
-          width: viewBoxDims()[2] * fit,
-          height: viewBoxDims()[3] * fit,
-          flex: "0 0 auto",
+          position: "absolute",
+          left: 0,
+          top: 0,
+          borderRadius: 2,
+          boxShadow: "0 18px 60px rgba(18,24,38,0.16), 0 1px 0 rgba(255,255,255,0.8)",
+          transform: `translate(${cam.tx + vx * cam.zoom}px, ${cam.ty + vy * cam.zoom}px) scale(${cam.zoom})`,
+          transformOrigin: "top left",
         }}
       >
-        <div
-          ref={stageRef}
-          style={{
-            position: "absolute",
-            left: 0,
-            top: 0,
-            borderRadius: 2,
-            boxShadow: "0 18px 60px rgba(18,24,38,0.16), 0 1px 0 rgba(255,255,255,0.8)",
-            transform: `scale(${fit})`,
-            transformOrigin: "top left",
-          }}
+        {/* The injected SVG string — the SAME bytes the rasterizer consumes. */}
+        <div dangerouslySetInnerHTML={{ __html: svg }} />
+
+        {/* Selection outline(s) + resize handles, in the SVG's coord space. */}
+        <SelectionLayer selection={selection} zoom={cam.zoom} runActive={runActive} />
+
+        {/* Transient gesture overlay: create rubber-band + reparent drop target. */}
+        {(createRect || vectorPreview || reparentTarget) && (
+          <GestureOverlay
+            createRect={createRect}
+            vectorPreview={vectorPreview}
+            vectorPath={vectorPreview ? previewPath(vectorPreview) : null}
+            reparentTarget={reparentTarget}
+            zoom={cam.zoom}
+          />
+        )}
+
+        {/* Marks beat overlay — transient, from the live mirror bboxes. */}
+        {flashMarks && <MarksLayer boxes={markBoxes} />}
+      </div>
+
+      {/* Zoom control, bottom-left (clear of the agent's-eye thumbnail bottom-right). */}
+      <div className="zoom-control" aria-label="Zoom">
+        <button
+          className="tool-button"
+          onClick={() => zoomStep(1 / 1.2)}
+          title="Zoom out"
+          aria-label="Zoom out"
         >
-          {/* The injected SVG string — the SAME bytes the rasterizer consumes. */}
-          <div dangerouslySetInnerHTML={{ __html: svg }} />
-
-          {/* Selection outline(s) + resize handles, in the SVG's coord space. */}
-          <SelectionLayer selection={selection} fit={fit} runActive={runActive} />
-
-          {/* Transient gesture overlay: create rubber-band + reparent drop target. */}
-          {(createRect || vectorPreview || reparentTarget) && (
-            <GestureOverlay
-              createRect={createRect}
-              vectorPreview={vectorPreview}
-              vectorPath={vectorPreview ? previewPath(vectorPreview) : null}
-              reparentTarget={reparentTarget}
-              fit={fit}
-            />
-          )}
-
-          {/* Marks beat overlay — transient, from the live mirror bboxes. */}
-          {flashMarks && <MarksLayer boxes={markBoxes} />}
-        </div>
+          −
+        </button>
+        <span className="zoom-readout">{Math.round(cam.zoom * 100)}%</span>
+        <button
+          className="tool-button"
+          onClick={() => zoomStep(1.2)}
+          title="Zoom in"
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+        <button
+          className="tool-button zoom-fit"
+          onClick={() => fitToContent()}
+          title="Fit to content"
+          aria-label="Fit to content"
+        >
+          Fit
+        </button>
       </div>
 
       {/* Agent's-eye corner thumbnail (the server PNG the model actually saw). */}
@@ -716,26 +1076,27 @@ export function Canvas() {
 }
 
 function viewBoxDims() {
-  const root = docMirror.store.getNode(docMirror.store.rootId);
-  return root ? root.bbox : [0, 0, 0, 0];
+  // Frame ALL content (root frame UNION every node), so nodes that escaped the root
+  // frame stay visible. Equals root.bbox when nothing has escaped.
+  return contentBounds(docMirror.store, docMirror.store.rootId);
 }
 
 function SelectionLayer({
   selection,
-  fit,
+  zoom,
   runActive,
 }: {
   selection: NodeId[];
-  fit: number;
+  zoom: number;
   runActive: boolean;
 }) {
   const [vx, vy, vw, vh] = viewBoxDims();
   if (!selection.length) return null;
   // Handles only for a single, manipulable selection (resizeBBox is single-node and
-  // setBBox is single-id). Sized in SCREEN px by dividing the constant by `fit`.
+  // setBBox is single-id). Sized in SCREEN px by dividing the constant by zoom.
   const single = selection.length === 1 ? docMirror.store.getNode(selection[0]) : null;
   const showHandles = !!single && !runActive;
-  const hs = HANDLE_PX / fit; // handle side length in canvas units → ~HANDLE_PX on screen
+  const hs = HANDLE_PX / zoom; // handle side length in canvas units → ~HANDLE_PX on screen
   return (
     <svg
       viewBox={`${vx} ${vy} ${vw} ${vh}`}
@@ -786,7 +1147,7 @@ function SelectionLayer({
             height={hs}
             fill="#fff"
             stroke="#2563eb"
-            strokeWidth={1 / fit}
+            strokeWidth={1 / zoom}
             style={{ pointerEvents: "auto", cursor: HANDLE_CURSOR[id] }}
           />
         ))}
@@ -803,13 +1164,13 @@ function GestureOverlay({
   vectorPreview,
   vectorPath,
   reparentTarget,
-  fit,
+  zoom,
 }: {
   createRect: BBox | null;
   vectorPreview: VectorPreview | null;
   vectorPath: string | null;
   reparentTarget: NodeId | null;
-  fit: number;
+  zoom: number;
 }) {
   const [vx, vy, vw, vh] = viewBoxDims();
   const target = reparentTarget ? docMirror.store.getNode(reparentTarget) : null;
@@ -829,8 +1190,8 @@ function GestureOverlay({
           fill="#22c55e"
           fillOpacity={0.08}
           stroke="#16a34a"
-          strokeWidth={2 / fit}
-          strokeDasharray={`${6 / fit} ${4 / fit}`}
+          strokeWidth={2 / zoom}
+          strokeDasharray={`${6 / zoom} ${4 / zoom}`}
         />
       )}
       {createRect && (
@@ -842,8 +1203,8 @@ function GestureOverlay({
           fill="#2563eb"
           fillOpacity={0.08}
           stroke="#2563eb"
-          strokeWidth={1.5 / fit}
-          strokeDasharray={`${6 / fit} ${4 / fit}`}
+          strokeWidth={1.5 / zoom}
+          strokeDasharray={`${6 / zoom} ${4 / zoom}`}
         />
       )}
       {vectorPreview && vectorPath && (
@@ -855,14 +1216,14 @@ function GestureOverlay({
             height={vectorPreview.bbox[3]}
             fill="none"
             stroke="#2563eb"
-            strokeWidth={1 / fit}
-            strokeDasharray={`${4 / fit} ${4 / fit}`}
+            strokeWidth={1 / zoom}
+            strokeDasharray={`${4 / zoom} ${4 / zoom}`}
           />
           <path
             d={vectorPath}
             fill="none"
             stroke="#2563eb"
-            strokeWidth={4 / fit}
+            strokeWidth={4 / zoom}
             strokeLinecap="round"
             strokeLinejoin="round"
           />

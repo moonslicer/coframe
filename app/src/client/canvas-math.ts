@@ -23,6 +23,90 @@ export function clientToCanvas(
   return [cx, cy];
 }
 
+// --- Interactive camera (Phase 2; not yet wired into Canvas.tsx). The stage is
+// transformed as `translate(tx, ty) scale(zoom)` in SCREEN pixels relative to the
+// container's top-left (rect). tx/ty are screen-pixel offsets, zoom is unitless.
+export type Camera = { tx: number; ty: number; zoom: number };
+
+// Screen point -> canvas point. Inverse of the stage transform: subtract the
+// container origin and the camera translate, then undo the zoom.
+export function screenToCanvas(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number },
+  cam: Camera,
+): [number, number] {
+  const cx = (clientX - rect.left - cam.tx) / cam.zoom;
+  const cy = (clientY - rect.top - cam.ty) / cam.zoom;
+  return [cx, cy];
+}
+
+// Canvas point -> screen point (forward transform). Exact inverse of screenToCanvas.
+export function canvasToScreen(
+  canvasX: number,
+  canvasY: number,
+  rect: { left: number; top: number },
+  cam: Camera,
+): [number, number] {
+  const sx = rect.left + cam.tx + canvasX * cam.zoom;
+  const sy = rect.top + cam.ty + canvasY * cam.zoom;
+  return [sx, sy];
+}
+
+// Zoom about a fixed SCREEN anchor (the cursor): scale zoom by `factor`, clamped to
+// [minZoom, maxZoom], and shift tx/ty so the canvas point under the anchor stays put.
+// Derivation: the anchor's container-local offset (ax, ay) must satisfy
+// a = t + canvasUnderAnchor * zoom for both old & new zoom, so the canvas point
+// cancels out: tNew = a - (a - tOld) * zoomNew / zoomOld. Returns a NEW Camera.
+export function zoomAt(
+  cam: Camera,
+  factor: number,
+  anchorClientX: number,
+  anchorClientY: number,
+  rect: { left: number; top: number },
+  minZoom: number,
+  maxZoom: number,
+): Camera {
+  const zoom = Math.max(minZoom, Math.min(maxZoom, cam.zoom * factor));
+  const ax = anchorClientX - rect.left;
+  const ay = anchorClientY - rect.top;
+  const ratio = zoom / cam.zoom;
+  return {
+    tx: ax - (ax - cam.tx) * ratio,
+    ty: ay - (ay - cam.ty) * ratio,
+    zoom,
+  };
+}
+
+// Pan by a SCREEN-pixel delta. Zoom unchanged. Returns a NEW Camera.
+export function panCamera(cam: Camera, dxScreen: number, dyScreen: number): Camera {
+  return { tx: cam.tx + dxScreen, ty: cam.ty + dyScreen, zoom: cam.zoom };
+}
+
+// Camera that fits a canvas-space bbox into a container with padding, centered.
+// zoom fits the tighter axis (clamped), then tx/ty are set so the bbox center maps
+// to the container center. The reset / zoom-to-fit / zoom-to-selection primitive.
+export function fitCamera(
+  bbox: BBox,
+  container: { width: number; height: number },
+  padding: number,
+  minZoom: number,
+  maxZoom: number,
+): Camera {
+  const [bx, by, bw, bh] = bbox;
+  const sw = (container.width - 2 * padding) / bw;
+  const sh = (container.height - 2 * padding) / bh;
+  const zoom = Math.max(minZoom, Math.min(maxZoom, Math.min(sw, sh)));
+  // bbox center -> container center: center = t + bboxCenter * zoom  =>  t = center - bboxCenter*zoom
+  const bcx = bx + bw / 2;
+  const bcy = by + bh / 2;
+  return {
+    tx: container.width / 2 - bcx * zoom,
+    ty: container.height / 2 - bcy * zoom,
+    zoom,
+  };
+}
+
 // Translate a bbox by a canvas-space delta (drag-move). Size unchanged.
 export function moveBBox(orig: BBox, dx: number, dy: number): BBox {
   const [x, y, w, h] = orig;

@@ -15,6 +15,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { DocStore } from "../shared/store.js";
 import type { NodeId } from "../shared/types.js";
+import type { DesignSystemProfile } from "../shared/design-system.js";
 import { isErr } from "../shared/types.js";
 import { dispatch, REGISTRY } from "../shared/tools.js";
 import { getTree, fieldsFor, render, getMarks } from "../render/perception.js";
@@ -165,6 +166,7 @@ export async function runTask(
   rc: RunController,
   intent: string,
   selection: NodeId[],
+  designSystem: DesignSystemProfile | null = null,
 ): Promise<void> {
   // Lazily import the SDK adapter so non-agent code paths never load the SDK.
   const { plan: planIntent, act } = await import("./llm-adapter.js");
@@ -180,7 +182,7 @@ export async function runTask(
 
   let plan: Step[];
   try {
-    plan = await planIntent(intent, rootId, store, selection, (u) => rc.addUsage(u));
+    plan = await planIntent(intent, rootId, store, selection, (u) => rc.addUsage(u), designSystem);
   } catch (e) {
     return rc.finishEscalated(`Planning failed: ${(e as Error).message}`);
   }
@@ -286,7 +288,17 @@ export async function runTask(
       // Persist the per-turn perception as a user turn BEFORE act, so the request
       // ALWAYS starts with a user turn (otherwise call #2+ would begin with the prior
       // assistant tool_use turn -> Anthropic 400 "first message must be user").
-      rc.pushUser(perceptionBlocks({ tree, image: modelImage, markMap: modelImage ? markMap : {}, version, step, selection: rc.selection }));
+      rc.pushUser(
+        perceptionBlocks({
+          tree,
+          image: modelImage,
+          markMap: modelImage ? markMap : {},
+          version,
+          step,
+          selection: rc.selection,
+          designSystem,
+        }),
+      );
       // Strip stale images + scene-graphs from prior turns: each turn re-perceives, so
       // only THIS perception is current — keeping the rest is an O(n²) token blowup.
       pruneStalePerception(rc.messages);
@@ -415,11 +427,22 @@ export async function runTask(
         {
           type: "text",
           text:
-            `You just built this design for the request: "${intent}".\n` +
-            `Take ONE careful look at the rendered result and fix only CLEAR problems: overlapping or ` +
-            `clipped elements, misalignment, uneven spacing, weak hierarchy, or low contrast. Make ` +
-            `targeted edits with tools (setProps, setFill, setTextStyle, applyAutoLayout, alignDistribute, ` +
-            `placeBelow, or composeSubtree for a genuinely missing piece). Do NOT rebuild what is already fine.\n` +
+            `You just built this design for the request: "${intent}". Now do an ART-DIRECTOR pass on the ` +
+            `RENDERED image — judge it as a finished visual, not a wireframe.\n\n` +
+            `First fix any CLEAR defect: overlapping or clipped elements, misalignment, uneven spacing, ` +
+            `weak hierarchy, or low contrast.\n` +
+            `Then RAISE THE FIDELITY where it reads flat or placeholder-y — this is what separates a polished ` +
+            `product mock from a wireframe:\n` +
+            `  • Flat solid headers/buttons/hero or background panels → give them a GRADIENT (setGradient, or ` +
+            `setProps style.fills) when it suits the style.\n` +
+            `  • Cards / floating bars / modals sitting flat on the page → add a drop SHADOW for elevation ` +
+            `(setProps style.shadow = {y,blur,color}).\n` +
+            `  • Placeholder squares/circles standing in for like / comment / share / bookmark / nav / tab ` +
+            `icons → replace them with REAL glyphs (createIcon: heart, comment, share, bookmark, home, search, ` +
+            `user, settings, bell, star, play, plus, more, menu, …).\n` +
+            `  • Frosted/glass panels → add \`blur\` (setProps style.blur).\n` +
+            `Make targeted edits only — do NOT rebuild what already works, and keep the requested style ` +
+            `(don't gild a deliberately minimal/brutalist design).\n` +
             `IMPORTANT: to REPOSITION a frame that has children, use alignDistribute or placeBelow (they carry ` +
             `the children with it). Do NOT use setBBox/setBBoxes to move a container — that moves the frame ` +
             `alone and leaves its children behind. setBBox is only for a single leaf node or a pure resize.\n\n` +
@@ -427,7 +450,7 @@ export async function runTask(
             `markMap (number -> NodeId): ${JSON.stringify(r.markMap)}`,
         },
         { type: "image", source: { type: "base64", media_type: "image/png", data: r.image } },
-        { type: "text", text: "If it already looks polished, make NO tool calls and stop." },
+        { type: "text", text: "If it already looks polished and has real depth, make NO tool calls and stop." },
       ];
       rc.transition("ACTING");
       rc.turns += 1;

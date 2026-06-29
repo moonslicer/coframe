@@ -9,11 +9,15 @@
 // rather than bolted onto the loop's event vocabulary.
 
 import type { DocVersion, Node, NodeId } from "./types.js";
+import type { DesignSystemProfile } from "./design-system.js";
 import type { ServerEvent as RunEvent } from "../agent/run-controller.js";
 
 // ---- client -> server ----
 export type ClientMessage =
   | { t: "prompt"; text: string; selection: NodeId[]; seedDocId?: string }
+  | { t: "clarification-answer"; original: string; answers: string; selection: NodeId[] }
+  | { t: "importDesignSystem"; html?: string; sourceUrl?: string; sourceName?: string }
+  | { t: "clearDesignSystem" }
   | { t: "undo" }
   | { t: "redo" }
   | { t: "select"; ids: NodeId[] }
@@ -54,6 +58,17 @@ export interface RejectedMessage {
   t: "rejected";
   reason: string;
 }
+export interface ClarificationRequestMessage {
+  t: "clarification-request";
+  original: string;
+  questions: string[];
+  assumptions: string[];
+}
+export interface DesignSystemMessage {
+  t: "design-system";
+  designSystem: DesignSystemProfile | null;
+  error?: string;
+}
 
 export type ServerMessage =
   | RunEvent
@@ -61,7 +76,9 @@ export type ServerMessage =
   | UndoneMessage
   | RedoneMessage
   | HistoryStateMessage
-  | RejectedMessage;
+  | RejectedMessage
+  | ClarificationRequestMessage
+  | DesignSystemMessage;
 
 // Re-export the run-event union so the client imports run-event types from one place.
 export type { RunEvent };

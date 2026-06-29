@@ -31,6 +31,10 @@ function route(msg: ServerMessage) {
     case "ops-applied":
       docMirror.applyOps(msg.ops, msg.version);
       break;
+    case "phase":
+      if (msg.phase === "PLANNING") docMirror.clearSelection();
+      runStore.apply(msg);
+      break;
     case "rejected":
       // A rejected human edit left an optimistic preview diverged from the server.
       // Re-anchor to authoritative truth (mirrors the reparent timeout→resync path),
@@ -74,11 +78,8 @@ function sendWhenOpen(msg: ClientMessage) {
 }
 
 export function send(msg: ClientMessage): void {
-  if (msg.t === "prompt") {
+  if (msg.t === "prompt" || msg.t === "clarification-answer") {
     runStore.startRun();
-    // Clear selection as the run STARTS: the resolved id set is already shipped with
-    // the prompt, and a stale outline must not linger across the run or into the next.
-    docMirror.clearSelection();
   }
   sendWhenOpen(msg);
 }

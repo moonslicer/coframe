@@ -1,23 +1,35 @@
-// ALL @anthropic-ai/sdk usage is confined to this module (the only file that imports
-// the SDK, per §4.5). It exposes:
+// LLM provider access lives behind this adapter. Anthropic remains the internal
+// message/tool-history shape used by the loop; the OpenAI path translates that shape
+// to Responses API function calls at the boundary. It exposes:
 //   - SYSTEM_PROMPT — silence-default + prescriptive tone, ported from
 //     headless-loop/src/llm.ts (full silence tuning + count_tokens is Day 6).
 //   - plan(intent, rootId, store, selection) -> Step[] via a forced tool-call
 //     (tool_choice: emit_plan) whose schema is the Step[] shape.
-//   - act(messages, ctx) -> one NON-streaming tool-use turn (streaming is Day 6);
-//     branches on stop_reason==='refusal' BEFORE reading content.
+//   - act(messages, ctx) -> one provider-specific tool-use turn; branches on
+//     stop_reason==='refusal' BEFORE reading content.
 //
 // The pinned SDK types (0.32.1) lag the API — adaptive thinking / effort / structured
 // fields are cast through `any`, exactly the pattern headless-loop/src/llm.ts uses.
 
 import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+import type {
+  FunctionTool as OpenAIFunctionTool,
+  Response as OpenAIResponse,
+  ResponseInputContent,
+  ResponseInputItem,
+} from "openai/resources/responses/responses";
 import type { DocStore } from "../shared/store.js";
 import type { NodeId } from "../shared/types.js";
+import type { DesignSystemProfile } from "../shared/design-system.js";
 import { buildAnthropicTools, assertValidToolSchemas } from "../shared/tools.js";
 import { getTree } from "../render/perception.js";
 import type { Step, SuccessCriterion } from "./types.js";
 
-const MODEL = "claude-sonnet-4-6";
+type LLMProvider = "anthropic" | "openai";
+
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? process.env.LLM_MODEL ?? "claude-sonnet-4-6";
+const OPENAI_MODEL = process.env.OPENAI_MODEL ?? process.env.LLM_MODEL ?? "gpt-5.5";
 const TOOLS = buildAnthropicTools();
 
 // The pinned SDK (0.32.1) does not export ContentBlockParam; reconstruct it from
@@ -53,9 +65,19 @@ Design quality defaults:
   states, and enough surrounding context to feel usable. Components need their expected inner details.
 - Avoid bare rectangles. When you create a panel, card, button, toolbar, row, or modal, style its fill,
   radius, border/stroke, text hierarchy, and internal spacing so it reads as a finished object.
+- Use DEPTH and real detail, not flat solid blocks (flat fills read as a wireframe). The build tools take
+  rich style: gradients (composeSubtree \`gradient\`{from,to,angle} or setGradient) for headers, buttons,
+  hero/background fills; drop shadows (composeSubtree \`shadow\` or setProps style.shadow) to elevate cards
+  and floating bars; \`blur\` for frosted/glass panels; and REAL icons (composeSubtree \`icon\` or createIcon —
+  heart, comment, share, bookmark, home, search, user, settings, bell, star, play, plus, more, menu, …)
+  instead of placeholder squares for any like/comment/share/nav/tab affordance. Reach for these whenever
+  the style is meant to feel polished, modern, premium, glossy, glassy, or app-like.
 - Match the prompt's platform conventions when named: mobile screens should feel mobile-sized and touchable;
   iOS-like UIs use larger radii, translucent panels, generous vertical rhythm, and centered/aligned symbols;
   operational dashboards are denser, quieter, and scan-friendly.
+- If an imported design system brief is provided in the user turn, treat it as the default source for
+  colors, typography, spacing, radii, component families, and interaction patterns. Use it for generated
+  apps/components unless the human explicitly asks for a different style.
 
 Rules:
 - ALWAYS act through tools. Do not describe what you would do — call the tool that does it.
@@ -94,7 +116,32 @@ Rules:
 - When MOVING a node, preserve its existing width and height (read them from the scene graph) and change
   only x and y. Do not resize a node unless the user explicitly asked to resize it.
 - Default to SILENCE between tool calls. Emit at most one short terse line per action. No narration, no
-  preamble, no recap. When the step's goal is met, stop calling tools.`;
+  preamble, no recap. When the step's goal is met, stop calling tools.
+
+Interactive prototypes (multi-screen apps):
+- When the request is for an APP, PROTOTYPE, FLOW, or names MULTIPLE screens/pages or interaction
+  ("tappable", "clickable", "navigate", "with a working nav/tab bar", "toggle"), build something the user
+  can CLICK THROUGH — several screens wired together, not one static frame.
+- Build EACH screen as its own composeSubtree with screen:true and parent = the page root. Give every
+  screen complete, realistic content (header, body, and a nav/tab bar where the platform implies one).
+  Screens auto-arrange left-to-right as a filmstrip — you never position them.
+- AFTER the screens exist, WIRE them with setInteraction: a nav tab / button / list row that should
+  change the view gets action 'navigate' with target = the destination SCREEN; a back chevron gets 'back'.
+  For a dropdown / menu / accordion, create its body, setHidden it true, then wire its trigger with
+  'toggle'. For a modal / sheet, create it, setHidden it true, wire the opener with 'openOverlay' and its
+  close/X with 'closeOverlay'. Wire every primary affordance the request implies so the prototype plays.
+- For a single-screen or pure-styling request, do NOT add screens or interactions — behave exactly as before.
+
+Forms & cross-screen variables (sign-up, login, checkout, settings):
+- For any field the user FILLS IN, make a real input: give a composeSubtree node an \`input\` {field, kind,
+  placeholder, required}, or call createInput. \`field\` is a VARIABLE name (e.g. name, email, password);
+  \`kind\` is text|email|password|number|textarea|select|checkbox|switch. Don't fake a field with a plain
+  RECT — it won't be typeable and won't carry a value.
+- A value typed on one screen is shown on any later screen by putting {{field}} inside a TEXT node's chars.
+  So a sign-up flow collects {field:'name'} and {field:'email'} on screen 1, and the confirmation screen
+  has a TEXT like "You're all set, {{name}}!" — at play time it fills in what was typed.
+- Pair each input with a label TEXT above it (checkbox/switch take a \`label\` instead). Mark the fields a
+  step can't proceed without as required:true — a 'navigate' button is blocked until they're filled.`;
 
 // ---- plan: one Opus call, forced emit_plan tool-call returning Step[] ----
 
@@ -135,7 +182,13 @@ const PLAN_TOOL: Anthropic.Tool = {
     "only if you can predict it; otherwise verify the parent still holds them with `childCount` " +
     "{frameId: their EXISTING parent, count:<n>} — a permissive but valid criterion so the step can pass.\n" +
     "- 'make the selected nodes match node X's style' -> ONE setFill/setTextStyle step; verify with `prop` " +
-    "{id: one of the OTHER selected EXISTING ids, path:'style.fills', equals: X's current fills array}.",
+    "{id: one of the OTHER selected EXISTING ids, path:'style.fills', equals: X's current fills array}.\n" +
+    "INTERACTIVE PROTOTYPES — only when the intent asks for an APP / PROTOTYPE / FLOW / multiple screens or " +
+    "interaction (otherwise ignore this entirely and plan as above): plan ONE step per screen (build it with " +
+    "composeSubtree screen:true) PLUS a final 'wire the interactions' step. Verify a multi-screen build with " +
+    "`screenCount` {count: number of screens}; verify the wiring with `hasInteraction` {action, and EITHER an " +
+    "existing `id` OR parentId+type+nameLike for a node created this run}. Do not over-split: 3 screens + 1 " +
+    "wiring step is 4 steps, not 10.",
   input_schema: {
     type: "object",
     properties: {
@@ -186,6 +239,8 @@ const PLAN_TOOL: Anthropic.Tool = {
                     "belowOf",
                     "belowOfNamed",
                     "aligned",
+                    "screenCount",
+                    "hasInteraction",
                   ],
                 },
                 parentId: { type: "string", description: "nodeExists: parent NodeId." },
@@ -217,6 +272,13 @@ const PLAN_TOOL: Anthropic.Tool = {
                   enum: ["LEFT", "RIGHT", "TOP", "BOTTOM", "CENTER_X", "CENTER_Y"],
                   description: "aligned: which edge/center the ids must agree on.",
                 },
+                action: {
+                  type: "string",
+                  enum: ["navigate", "toggle", "openOverlay", "closeOverlay", "back"],
+                  description:
+                    "hasInteraction: the click action the node must carry. " +
+                    "(screenCount reuses `count`; hasInteraction resolves the node by `id` OR parentId+type+nameLike.)",
+                },
               },
               required: ["kind"],
             },
@@ -229,13 +291,261 @@ const PLAN_TOOL: Anthropic.Tool = {
   },
 };
 
-let sharedClient: Anthropic | null = null;
-function client(): Anthropic {
-  if (!sharedClient) {
-    assertValidToolSchemas(); // fail fast on a malformed generated schema
-    sharedClient = new Anthropic(); // reads ANTHROPIC_API_KEY from env
+// ---- clarify: one cheap forced tool-call deciding whether to ask the human first ----
+
+// A short, dedicated intake prompt (NOT the big build SYSTEM_PROMPT — this turn writes
+// no tools, it only judges ambiguity). The model, not a regex, decides when a generative
+// request is under-specified enough that 1-3 questions would change what gets built.
+const CLARIFY_SYSTEM = `You are the intake step of a design agent that builds and edits a Figma-like vector canvas.
+Before a build starts, decide whether the user's request is ambiguous enough that asking 1-3 short
+clarifying questions would MATERIALLY change what gets designed.
+
+Ask ONLY when the request is open-ended/generative (e.g. "design a dashboard", "make an app",
+"build a landing page") AND under-specified along dimensions that would send the result in genuinely
+different directions — typically the product/domain or user job, the primary user and their first
+action, or the visual direction. As a rule of thumb, ask when TWO OR MORE of those are missing.
+
+Do NOT ask when:
+- the request is a concrete edit to existing canvas nodes (align, distribute, move, resize, recolor,
+  restyle, rename, delete, "make these…", "the selected…") — node(s) are likely selected,
+- the user already named enough to proceed (e.g. product + audience, or a clear style + domain),
+- a sensible default would obviously satisfy the request. ONE missing dimension is usually safe to infer.
+
+When you DO ask: 1-3 SHORT, specific questions concrete to THIS request (not generic boilerplate),
+each paired with a reasonable default assumption the user can accept with one click. When you don't,
+return needsClarification:false with empty arrays. Prefer building over interrogating — only interrupt
+when the ambiguity is real.`;
+
+const CLARIFY_TOOL: Anthropic.Tool = {
+  name: "assess_clarity",
+  description:
+    "Report whether to ask the human clarifying questions before building, and if so, which. " +
+    "Set needsClarification true ONLY for genuinely ambiguous open-ended design requests; for concrete " +
+    "edits or already-specified requests set it false with empty arrays.",
+  input_schema: {
+    type: "object",
+    properties: {
+      needsClarification: {
+        type: "boolean",
+        description: "true to pause and ask the human; false to build immediately.",
+      },
+      questions: {
+        type: "array",
+        items: { type: "string" },
+        description: "1-3 short, specific questions. Empty when needsClarification is false.",
+      },
+      assumptions: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "A reasonable default answer for each question (same order), so the human can proceed " +
+          "in one click. Empty when needsClarification is false.",
+      },
+    },
+    required: ["needsClarification", "questions", "assumptions"],
+  },
+};
+
+let schemasAsserted = false;
+let sharedAnthropicClient: Anthropic | null = null;
+let sharedOpenAIClient: OpenAI | null = null;
+
+function ensureToolSchemas(): void {
+  if (schemasAsserted) return;
+  assertValidToolSchemas(); // fail fast on a malformed generated schema
+  schemasAsserted = true;
+}
+
+function provider(): LLMProvider {
+  const raw = (process.env.LLM_PROVIDER ?? process.env.MODEL_PROVIDER ?? "").toLowerCase();
+  if (raw === "openai" || raw === "anthropic") return raw;
+  if (process.env.OPENAI_API_KEY || process.env.OPENAI_MODEL) return "openai";
+  return "anthropic";
+}
+
+function anthropicClient(): Anthropic {
+  ensureToolSchemas();
+  if (!sharedAnthropicClient) sharedAnthropicClient = new Anthropic(); // reads ANTHROPIC_API_KEY
+  return sharedAnthropicClient;
+}
+
+function openAIClient(): OpenAI {
+  ensureToolSchemas();
+  if (!process.env.OPENAI_API_KEY)
+    throw new Error("OPENAI_API_KEY is required when LLM_PROVIDER=openai or OPENAI_MODEL is set.");
+  if (!sharedOpenAIClient) sharedOpenAIClient = new OpenAI(); // reads OPENAI_API_KEY
+  return sharedOpenAIClient;
+}
+
+function toOpenAITool(tool: Anthropic.Tool): OpenAIFunctionTool {
+  return {
+    type: "function",
+    name: tool.name,
+    description: tool.description ?? null,
+    parameters: tool.input_schema as Record<string, unknown>,
+    strict: false,
+  };
+}
+
+function shouldSendReasoning(model: string): boolean {
+  return /^(gpt-5|o\d|o[1-9]-)/i.test(model);
+}
+
+function openAIParams(
+  input: string | ResponseInputItem[],
+  tools: Anthropic.Tool[],
+  maxOutputTokens: number,
+  toolChoice?: "auto" | "required" | { type: "function"; name: string },
+  effort?: "low" | "medium" | "high" | "xhigh",
+  instructions?: string,
+): Record<string, unknown> {
+  const model = OPENAI_MODEL;
+  const params: Record<string, unknown> = {
+    model,
+    instructions: instructions ?? SYSTEM_PROMPT,
+    input,
+    max_output_tokens: maxOutputTokens,
+    parallel_tool_calls: false,
+    store: false,
+    tools: tools.map(toOpenAITool),
+    tool_choice: toolChoice ?? "auto",
+  };
+  if (effort && shouldSendReasoning(model)) params.reasoning = { effort };
+  return params;
+}
+
+function parseToolArguments(raw: string): unknown {
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return raw;
   }
-  return sharedClient;
+}
+
+function stringifyToolOutput(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        const p = part as { type?: string; text?: string };
+        return p.type === "text" && typeof p.text === "string" ? p.text : JSON.stringify(part);
+      })
+      .join("\n");
+  }
+  return JSON.stringify(content ?? "");
+}
+
+function readOpenAIUsage(u: unknown): Usage {
+  const x = (u ?? {}) as {
+    input_tokens?: number;
+    output_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number };
+  };
+  return {
+    input: x.input_tokens ?? 0,
+    output: x.output_tokens ?? 0,
+    cacheRead: x.input_tokens_details?.cached_tokens ?? 0,
+    cacheCreate: 0,
+  };
+}
+
+function extractOpenAIResult(response: OpenAIResponse): ActResult {
+  let text = "";
+  let stopReason: string | null = response.status ?? null;
+  const toolUses: ActResult["toolUses"] = [];
+  for (const item of response.output ?? []) {
+    if (item.type === "message") {
+      for (const c of item.content) {
+        if (c.type === "output_text") text += c.text;
+        else if (c.type === "refusal") {
+          text += c.refusal;
+          stopReason = "refusal";
+        }
+      }
+    } else if (item.type === "function_call") {
+      toolUses.push({
+        id: item.call_id,
+        name: item.name,
+        input: parseToolArguments(item.arguments),
+      });
+    }
+  }
+  return {
+    stopReason,
+    toolUses,
+    text,
+    usage: readOpenAIUsage(response.usage),
+  };
+}
+
+function anthropicBlocks(content: Anthropic.MessageParam["content"]): ContentBlockParam[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return content;
+}
+
+function openAIInputFromAnthropic(messages: Anthropic.MessageParam[]): ResponseInputItem[] {
+  const items: ResponseInputItem[] = [];
+
+  const flushUser = (content: ResponseInputContent[]) => {
+    if (content.length) items.push({ type: "message", role: "user", content });
+  };
+  const flushAssistant = (texts: string[]) => {
+    const text = texts.join("\n").trim();
+    if (text) items.push({ type: "message", role: "assistant", content: text });
+  };
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      let pending: ResponseInputContent[] = [];
+      for (const block of anthropicBlocks(message.content)) {
+        const b = block as {
+          type: string;
+          text?: string;
+          source?: { type?: string; media_type?: string; data?: string };
+          tool_use_id?: string;
+          content?: unknown;
+        };
+        if (b.type === "text") {
+          pending.push({ type: "input_text", text: b.text ?? "" });
+        } else if (b.type === "image" && b.source?.type === "base64" && b.source.data) {
+          pending.push({
+            type: "input_image",
+            detail: "auto",
+            image_url: `data:${b.source.media_type ?? "image/png"};base64,${b.source.data}`,
+          });
+        } else if (b.type === "tool_result" && b.tool_use_id) {
+          flushUser(pending);
+          pending = [];
+          items.push({
+            type: "function_call_output",
+            call_id: b.tool_use_id,
+            output: stringifyToolOutput(b.content),
+          });
+        }
+      }
+      flushUser(pending);
+    } else if (message.role === "assistant") {
+      let pendingText: string[] = [];
+      for (const block of anthropicBlocks(message.content)) {
+        const b = block as { type: string; text?: string; id?: string; name?: string; input?: unknown };
+        if (b.type === "text") {
+          pendingText.push(b.text ?? "");
+        } else if (b.type === "tool_use" && b.id && b.name) {
+          flushAssistant(pendingText);
+          pendingText = [];
+          items.push({
+            type: "function_call",
+            call_id: b.id,
+            name: b.name,
+            arguments: JSON.stringify(b.input ?? {}),
+          });
+        }
+      }
+      flushAssistant(pendingText);
+    }
+  }
+
+  return items;
 }
 
 /** Plan the intent into ordered, criterion-carrying steps (one forced tool-call). */
@@ -245,6 +555,7 @@ export async function plan(
   store: DocStore,
   selection: NodeId[],
   onUsage?: (u: Usage) => void,
+  designSystem?: DesignSystemProfile | null,
 ): Promise<Step[]> {
   // The planner projects ALL task-relevant fields (layout + style + text) so it can
   // both choose the right tool AND copy concrete values (e.g. a button's fills) into a
@@ -255,9 +566,13 @@ export async function plan(
   const selectionLine = selection.length
     ? `The human has selected these NodeIds: ${selection.join(", ")}.\n`
     : "";
+  const designSystemLine = designSystem
+    ? `Active design system brief:\n${designSystem.promptSummary}\n\n`
+    : "";
 
   const baseUser =
     `Intent: ${intent}\n\n` +
+    designSystemLine +
     selectionLine +
     `Working frame root: ${rootId}\n` +
     `Current scene graph (scoped):\n${JSON.stringify(tree)}\n\n` +
@@ -277,7 +592,12 @@ export async function plan(
     `the step(s) that CREATE that inner content and verify the CONTENT (e.g. nodeExists TEXT by nameLike, or ` +
     `childCountNamed on the container), NOT just the container: a frame with no children renders blank. ` +
     `(A request that only aligns, distributes, restyles, or moves EXISTING nodes creates no new content — ` +
-    `plan it as the usual single step; never return an empty plan for it.)`;
+    `plan it as the usual single step; never return an empty plan for it.)\n\n` +
+    `If — and only if — the intent asks for an APP, PROTOTYPE, FLOW, multiple screens/pages, or interaction ` +
+    `(tappable, clickable, navigate, working nav/tab bar, toggle), plan a MULTI-SCREEN prototype: one step ` +
+    `per screen (each built with composeSubtree screen:true, verified by screenCount), then a final step that ` +
+    `wires navigation/toggles/overlays with setInteraction (verified by hasInteraction). For any ordinary ` +
+    `single-screen or styling request, ignore this and plan as usual.`;
 
   // Two attempts: an empty plan is almost always a model slip (esp. on align/distribute
   // of EXISTING nodes), not a genuine "nothing to do" — so retry once with a hard nudge
@@ -289,8 +609,30 @@ export async function plan(
     `prop criterion on layout.mode (HORIZONTAL/VERTICAL) or a childCount on the parent. Emit it now.`;
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (provider() === "openai") {
+      const response = (await openAIClient().responses.create(
+        openAIParams(
+          attempt === 0 ? baseUser : baseUser + NUDGE,
+          [PLAN_TOOL],
+          4000,
+          { type: "function", name: "emit_plan" },
+          "high",
+        ) as any,
+      )) as OpenAIResponse;
+      const result = extractOpenAIResult(response);
+      onUsage?.(result.usage);
+      if (result.stopReason === "refusal") throw new Error("Planner refused the request.");
+
+      const toolCall = result.toolUses.find((t) => t.name === "emit_plan");
+      if (!toolCall) throw new Error("Planner did not emit a plan tool-call.");
+
+      const steps = coercePlanSteps(toolCall.input);
+      if (steps.length > 0) return steps;
+      continue;
+    }
+
     const params: Anthropic.MessageCreateParamsNonStreaming = {
-      model: MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens: 4000,
       system: cachedSystem(SYSTEM_PROMPT),
       tools: [PLAN_TOOL],
@@ -300,7 +642,7 @@ export async function plan(
     // pinned SDK types lag the API: effort only (forced tool_choice ⇒ no adaptive thinking).
     (params as any).output_config = { effort: "high" };
 
-    const msg = await client().messages.create(params);
+    const msg = await anthropicClient().messages.create(params);
     onUsage?.(readUsage(msg.usage));
     if ((msg.stop_reason as string) === "refusal")
       throw new Error("Planner refused the request.");
@@ -336,6 +678,86 @@ export function coercePlanSteps(input: unknown): Step[] {
   }));
 }
 
+/** Parse an assess_clarity tool input into a clarification, or null to build now.
+ *  Defensive like coercePlanSteps: only clarify when the model explicitly asked AND
+ *  gave at least one usable question — a true flag with no questions is nothing to ask,
+ *  so we fall through to building. Exported for the offline smoke test. */
+export function coerceClarification(
+  input: unknown,
+): { questions: string[]; assumptions: string[] } | null {
+  const raw = (input ?? {}) as {
+    needsClarification?: unknown;
+    questions?: unknown;
+    assumptions?: unknown;
+  };
+  if (raw.needsClarification !== true) return null;
+  const clean = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean).slice(0, 3) : [];
+  const questions = clean(raw.questions);
+  if (questions.length === 0) return null;
+  return { questions, assumptions: clean(raw.assumptions) };
+}
+
+/** One cheap forced tool-call: should we ask the human before building? Returns the
+ *  questions+assumptions to surface, or null to proceed straight to plan(). Runs at LOW
+ *  effort with a tiny budget — it taxes every prompt by one fast round-trip, so keep it
+ *  small. Selection / active design-system context nudge the model away from interrupting
+ *  concrete edits. */
+export async function assessClarification(
+  intent: string,
+  selection: NodeId[] = [],
+  onUsage?: (u: Usage) => void,
+  designSystem?: DesignSystemProfile | null,
+): Promise<{ questions: string[]; assumptions: string[] } | null> {
+  const selectionLine = selection.length
+    ? `The user has ${selection.length} canvas node(s) selected — this is most likely a direct edit to them.\n`
+    : "";
+  const designSystemLine = designSystem
+    ? `An imported design system brief is active, so the visual direction is already constrained.\n`
+    : "";
+  const user =
+    `User request: ${intent}\n\n` +
+    selectionLine +
+    designSystemLine +
+    `Decide whether to ask clarifying questions before building, then call assess_clarity.`;
+
+  if (provider() === "openai") {
+    const response = (await openAIClient().responses.create(
+      openAIParams(
+        user,
+        [CLARIFY_TOOL],
+        600,
+        { type: "function", name: "assess_clarity" },
+        "low",
+        CLARIFY_SYSTEM,
+      ) as any,
+    )) as OpenAIResponse;
+    const result = extractOpenAIResult(response);
+    onUsage?.(result.usage);
+    if (result.stopReason === "refusal") return null;
+    const call = result.toolUses.find((t) => t.name === "assess_clarity");
+    return coerceClarification(call?.input);
+  }
+
+  const params: Anthropic.MessageCreateParamsNonStreaming = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: 600,
+    system: cachedSystem(CLARIFY_SYSTEM),
+    tools: [CLARIFY_TOOL],
+    tool_choice: { type: "tool", name: "assess_clarity" },
+    messages: [{ role: "user", content: user }],
+  };
+  // pinned SDK types lag the API: effort only (forced tool_choice ⇒ no adaptive thinking).
+  (params as any).output_config = { effort: "low" };
+
+  const msg = await anthropicClient().messages.create(params);
+  onUsage?.(readUsage(msg.usage));
+  if ((msg.stop_reason as string) === "refusal") return null;
+  const block = msg.content.find((b) => b.type === "tool_use");
+  if (!block || block.type !== "tool_use") return null;
+  return coerceClarification(block.input);
+}
+
 // ---- act: one NON-streaming tool-use turn (streaming is Day 6) ----
 
 export interface ActContext {
@@ -351,6 +773,8 @@ export interface ActContext {
    *  labeled "delete the selected titles" is ambiguous and the model touches only one
    *  node, completing partially while verify (a single post-condition) still passes. */
   selection?: NodeId[];
+  /** Optional imported design system that should guide this app/component generation. */
+  designSystem?: DesignSystemProfile | null;
 }
 
 /** Per-call token usage, surfaced so the loop can measure the cost of a run. */
@@ -397,6 +821,9 @@ export function perceptionBlocks(ctx: ActContext): ContentBlockParam[] {
     type: "text",
     text:
       `Current step [${ctx.step.index}]: ${ctx.step.label}\n\n` +
+      (ctx.designSystem
+        ? `Active design system brief:\n${ctx.designSystem.promptSummary}\n\n`
+        : "") +
       (ctx.selection && ctx.selection.length
         ? `The human selected these NodeIds — they are your targets for THIS step. If the step ` +
           `acts on "the selected"/"each"/"every"/"all" of them, apply the change to EVERY id ` +
@@ -475,8 +902,16 @@ export async function act(
   messages: Anthropic.MessageParam[],
   onDelta?: OnActDelta,
 ): Promise<ActResult> {
+  if (provider() === "openai") {
+    onDelta?.({ kind: "thinking" });
+    const response = (await openAIClient().responses.create(
+      openAIParams(openAIInputFromAnthropic(messages), TOOLS, 8000, "auto", "medium") as any,
+    )) as OpenAIResponse;
+    return extractOpenAIResult(response);
+  }
+
   const params: Anthropic.MessageCreateParamsStreaming = {
-    model: MODEL,
+    model: ANTHROPIC_MODEL,
     max_tokens: 8000,
     system: cachedSystem(SYSTEM_PROMPT),
     tools: TOOLS, // byte-stable, deterministically ordered -> cacheable
@@ -492,7 +927,7 @@ export async function act(
   (params as any).thinking = { type: "adaptive", display: "summarized" };
   (params as any).output_config = { effort: "medium" };
 
-  const stream = client().messages.stream(params);
+  const stream = anthropicClient().messages.stream(params);
 
   // Raw stream events: the verb must render the instant the tool_use block OPENS.
   stream.on("streamEvent", (e: Anthropic.MessageStreamEvent) => {

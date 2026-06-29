@@ -30,6 +30,12 @@ export interface TreeNode {
   name: string;
   bbox: Node["bbox"];
   childCount: number;
+  // Prototype-interactivity fields are ALWAYS emitted when set (tiny, and the agent must
+  // see existing screens/wiring to reference a nav target and avoid duplicating a screen).
+  screen?: Node["screen"];
+  hidden?: Node["hidden"];
+  interactions?: Node["interactions"];
+  input?: Node["input"];
   // opt-in projected fields
   style?: Node["style"];
   text?: Node["text"];
@@ -73,6 +79,10 @@ export function getTree(
       bbox: n.bbox,
       childCount: n.children.length,
     };
+    if (n.screen) row.screen = true;
+    if (n.hidden) row.hidden = true;
+    if (n.interactions?.length) row.interactions = n.interactions;
+    if (n.input) row.input = n.input;
     for (const f of fields) {
       const v = n[f];
       if (v !== undefined) (row as unknown as Record<string, unknown>)[f] = v; // project task-relevant fields only

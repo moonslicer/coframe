@@ -341,6 +341,34 @@ export function verifyStructural(
           `(below? ${ok})`,
       };
     }
+
+    case "screenCount": {
+      const root = store.getNode(store.rootId);
+      const n = root ? root.children.filter((id) => store.getNode(id)?.screen).length : 0;
+      return { ok: n >= criterion.count, evidence: `${n} screen(s), wanted >= ${criterion.count}` };
+    }
+
+    case "hasInteraction": {
+      const node = criterion.id
+        ? store.getNode(criterion.id)
+        : criterion.parentId
+          ? findChild(store, criterion.parentId, criterion.type ?? "FRAME", criterion.nameLike)
+          : undefined;
+      if (!node)
+        return {
+          ok: false,
+          evidence: criterion.id
+            ? `node ${criterion.id} does not exist`
+            : `no ${criterion.type ?? "FRAME"}` +
+              (criterion.nameLike ? ` matching "${criterion.nameLike}"` : "") +
+              ` found under ${criterion.parentId} to check interaction`,
+        };
+      const has = (node.interactions ?? []).some((it) => it.action === criterion.action);
+      return {
+        ok: has,
+        evidence: `${node.id} ("${node.name}") interactions = ${JSON.stringify(node.interactions ?? [])}, want action "${criterion.action}"`,
+      };
+    }
   }
 }
 

@@ -4,3 +4,6 @@ dist
 .env
 tmp
 dev.log
+
+server.log
+vite.log

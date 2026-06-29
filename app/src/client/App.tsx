@@ -7,16 +7,24 @@ import { useEffect, useRef, useState } from "react";
 import {
   CircleCheck,
   CircleX,
+  Link2,
   Loader2,
+  MessageCircleQuestion,
+  Palette,
+  Play,
   Redo2,
   SendHorizontal,
   Sparkles,
+  Trash2,
   Undo2,
+  Upload,
 } from "lucide-react";
 import { Canvas } from "./Canvas.js";
 import { Toolbar } from "./Toolbar.js";
 import { Inspector } from "./Inspector.js";
-import { docMirror, useDocVersion, useRunState } from "./stores.js";
+import { TreeView } from "./TreeView.js";
+import { PlayMode } from "./PlayMode.js";
+import { docMirror, entryScreen, playStore, useDocVersion, useRunState } from "./stores.js";
 import type { ActivityEntry } from "./stores.js";
 import { connect, send } from "./ws.js";
 import { SEEDS, SEED_PROMPTS } from "../shared/seed.js";
@@ -37,6 +45,10 @@ export function App() {
 
   const runActive =
     run.phase !== "IDLE" && run.phase !== "DONE" && run.phase !== "ESCALATED";
+
+  // The prototype is playable once at least one screen exists. (Reads the live mirror;
+  // useDocVersion above keeps this fresh as the agent adds screens.)
+  const playEntry = entryScreen(docMirror.store);
 
   // Cmd-Z / Ctrl-Z undo; Cmd-Shift-Z / Ctrl-Shift-Z and Ctrl-Y redo.
   useEffect(() => {
@@ -61,7 +73,16 @@ export function App() {
   function submit(prompt: string) {
     const t = prompt.trim();
     if (!t || runActive) return;
-    send({ t: "prompt", text: t, selection: docMirror.selection });
+    if (run.clarification) {
+      send({
+        t: "clarification-answer",
+        original: run.clarification.original,
+        answers: t,
+        selection: docMirror.selection,
+      });
+    } else {
+      send({ t: "prompt", text: t, selection: docMirror.selection });
+    }
     setText("");
   }
 
@@ -96,6 +117,16 @@ export function App() {
         )}
         <div className="topbar-actions">
           <button
+            className="play-action"
+            onClick={() => playEntry && playStore.enter(playEntry)}
+            disabled={runActive || !playEntry}
+            title={playEntry ? "Play prototype" : "Add screens to play"}
+            aria-label="Play prototype"
+          >
+            <Play size={15} />
+            <span>Play</span>
+          </button>
+          <button
             className="icon-button"
             onClick={() => send({ t: "undo" })}
             disabled={runActive || !run.canUndo}
@@ -124,8 +155,18 @@ export function App() {
       </main>
 
       <aside className="side-panel">
+        <Section title="Layers">
+          <TreeView />
+        </Section>
         <Section title="Properties">
           <Inspector />
+        </Section>
+        <Section title="Design System">
+          <DesignSystemPanel
+            profile={run.designSystem}
+            error={run.designSystemError}
+            runActive={runActive}
+          />
         </Section>
         <Section title="Activity">
           <ActivityLog activity={run.activity} phase={run.phase} />
@@ -137,6 +178,13 @@ export function App() {
 
       <footer className="prompt-dock">
         <SelectionChips runActive={runActive} />
+        {run.clarification && (
+          <ClarificationCard
+            questions={run.clarification.questions}
+            assumptions={run.clarification.assumptions}
+            onUseAssumptions={() => submit(run.clarification!.assumptions.join(" "))}
+          />
+        )}
         <div className="suggestion-row">
           {SUGGESTIONS.map((s) => (
             <button
@@ -162,7 +210,9 @@ export function App() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder={
-              docMirror.selection.length
+              run.clarification
+                ? "Answer the design questions…"
+                : docMirror.selection.length
                 ? `${docMirror.selection.length} selected — describe the edit…`
                 : "Describe the design edit…"
             }
@@ -178,6 +228,182 @@ export function App() {
           </button>
         </form>
       </footer>
+
+      {/* Prototype runtime — a full-bleed overlay; renders nothing unless playing. */}
+      <PlayMode />
+    </div>
+  );
+}
+
+function DesignSystemPanel({
+  profile,
+  error,
+  runActive,
+}: {
+  profile: ReturnType<typeof useRunState>["designSystem"];
+  error: string | null;
+  runActive: boolean;
+}) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [sourceUrl, setSourceUrl] = useState("");
+
+  function importUrl() {
+    const url = sourceUrl.trim();
+    if (!url || runActive) return;
+    send({ t: "importDesignSystem", sourceUrl: url, sourceName: url });
+  }
+
+  async function importFile(file: File) {
+    const html = await file.text();
+    send({ t: "importDesignSystem", html, sourceName: file.name });
+  }
+
+  return (
+    <div className="design-system-panel">
+      <div className="ds-import-row">
+        <input
+          className="ds-url-input"
+          value={sourceUrl}
+          onChange={(e) => setSourceUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") importUrl();
+          }}
+          placeholder="file:///Users/hao/Downloads/Haven%20Design%20System.html"
+          disabled={runActive}
+          aria-label="Design system file URL"
+        />
+        <button
+          className="icon-button ds-mini-action"
+          type="button"
+          onClick={importUrl}
+          disabled={runActive || !sourceUrl.trim()}
+          title="Import from URL"
+          aria-label="Import from URL"
+        >
+          <Link2 size={15} />
+        </button>
+        <button
+          className="icon-button ds-mini-action"
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={runActive}
+          title="Import HTML file"
+          aria-label="Import HTML file"
+        >
+          <Upload size={15} />
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".html,text/html"
+          hidden
+          onChange={(e) => {
+            const file = e.currentTarget.files?.[0];
+            e.currentTarget.value = "";
+            if (file) void importFile(file);
+          }}
+        />
+      </div>
+
+      {error && <div className="ds-error">{error}</div>}
+
+      {!profile ? (
+        <div className="empty-state">No design system imported.</div>
+      ) : (
+        <div className="ds-summary">
+          <div className="ds-summary-head">
+            <span className="ds-summary-icon">
+              <Palette size={15} />
+            </span>
+            <div className="ds-title-block">
+              <strong>{profile.name}</strong>
+              <span title={profile.source}>{profile.source}</span>
+            </div>
+            <button
+              className="icon-button ds-mini-action"
+              type="button"
+              onClick={() => send({ t: "clearDesignSystem" })}
+              disabled={runActive}
+              title="Clear design system"
+              aria-label="Clear design system"
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+
+          <div className="ds-swatch-row">
+            {profile.colors.slice(0, 10).map((c) => (
+              <span
+                key={c.value}
+                className="ds-swatch"
+                style={{ background: c.value }}
+                title={`${c.name} ${c.value}`}
+              />
+            ))}
+          </div>
+
+          <div className="ds-facts">
+            {profile.fonts.length > 0 && (
+              <div>
+                <span>Type</span>
+                <strong>{profile.fonts.slice(0, 2).join(", ")}</strong>
+              </div>
+            )}
+            {profile.radii.length > 0 && (
+              <div>
+                <span>Radii</span>
+                <strong>{profile.radii.slice(0, 3).join(", ")}</strong>
+              </div>
+            )}
+            {profile.spacing.length > 0 && (
+              <div>
+                <span>Space</span>
+                <strong>{profile.spacing.slice(0, 4).join(", ")}</strong>
+              </div>
+            )}
+          </div>
+
+          <div className="ds-component-row">
+            {profile.components.slice(0, 8).map((c) => (
+              <span key={c.kind} className="ds-component-chip" title={c.details.join(" ")}>
+                {c.name}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClarificationCard({
+  questions,
+  assumptions,
+  onUseAssumptions,
+}: {
+  questions: string[];
+  assumptions: string[];
+  onUseAssumptions: () => void;
+}) {
+  return (
+    <div className="clarification-card">
+      <div className="clarification-title">
+        <MessageCircleQuestion size={15} />
+        <span>A little direction first</span>
+      </div>
+      <ol className="clarification-list">
+        {questions.map((q) => (
+          <li key={q}>{q}</li>
+        ))}
+      </ol>
+      <button
+        className="clarification-assume"
+        type="button"
+        onClick={onUseAssumptions}
+        title={assumptions.join(" ")}
+      >
+        Use smart assumptions
+      </button>
     </div>
   );
 }

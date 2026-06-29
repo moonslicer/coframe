@@ -3,7 +3,7 @@
 // post-condition that asserts the TARGET NODE'S STATE — independent of which tools
 // ran, so verify can disagree with the tool calls (not a tautology).
 
-import type { Node, NodeId } from "../shared/types.js";
+import type { InteractionAction, Node, NodeId } from "../shared/types.js";
 
 export type SuccessCriterion =
   | { kind: "nodeExists"; parentId: NodeId; type: Node["type"]; nameLike?: string }
@@ -47,6 +47,19 @@ export type SuccessCriterion =
       type: Node["type"];
       nameLike?: string;
       targetId: NodeId;
+    }
+  // --- prototype interactivity ---
+  // The root holds at least `count` navigable screens (verifies a "build N screens" step).
+  | { kind: "screenCount"; count: number }
+  // A node carries a click interaction with `action`. The node is resolved by a fixed
+  // existing `id`, OR (for a node created this run) by parent+type+name like childProp.
+  | {
+      kind: "hasInteraction";
+      action: InteractionAction;
+      id?: NodeId;
+      parentId?: NodeId;
+      type?: Node["type"];
+      nameLike?: string;
     };
 
 export interface Step {

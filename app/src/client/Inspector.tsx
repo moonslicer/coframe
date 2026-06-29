@@ -12,6 +12,7 @@ import { useState } from "react";
 import { docMirror, useDocVersion, useRunState } from "./stores.js";
 import { sendTool } from "./ws.js";
 import type { Node, NodeId } from "../shared/types.js";
+import { paintColor } from "../shared/types.js";
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 type InspectorTier = "simple" | "pro" | "code";
@@ -49,6 +50,7 @@ export function Inspector() {
     return (
       <div>
         <div style={header}>{nodes.length} selected</div>
+        <GroupActions kind="group" ids={ids} disabled={runActive} />
         <TierTabs tier={tier} setTier={setTier} />
         <div key={groupKey}>
           {tier === "code" ? (
@@ -81,7 +83,11 @@ export function Inspector() {
           <CodeFields node={node} disabled={runActive} />
         ) : (
           <>
+            {node.type === "GROUP" && <GroupActions kind="ungroup" ids={[node.id]} disabled={runActive} />}
             <GeometryFields node={node} disabled={runActive} />
+            {(node.type === "FRAME" || node.type === "GROUP") && (
+              <AutoLayoutFields node={node} disabled={runActive} />
+            )}
             <FillField node={node} ids={[node.id]} disabled={runActive} />
             {isText && (
               <>
@@ -94,6 +100,7 @@ export function Inspector() {
                 <StrokeField node={node} disabled={runActive} />
                 <AppearanceFields node={node} disabled={runActive} />
                 <LayoutFields node={node} disabled={runActive} />
+                <SelfLayoutFields node={node} disabled={runActive} />
                 {node.type === "VECTOR" && <VectorFields node={node} disabled={runActive} />}
                 <DebugFields node={node} />
               </>
@@ -174,7 +181,7 @@ function FillField({
   ids: NodeId[];
   disabled: boolean;
 }) {
-  const current = node.type === "VECTOR" ? node.vector?.fill ?? "#000000" : node.style?.fills?.[0]?.color ?? "#000000";
+  const current = node.type === "VECTOR" ? node.vector?.fill ?? "#000000" : paintColor(node.style?.fills?.[0]) ?? "#000000";
   const [draft, setDraft] = useState(current);
 
   const commit = (val: string) => {
@@ -431,6 +438,133 @@ function AppearanceFields({ node, disabled }: { node: Node; disabled: boolean })
   );
 }
 
+// Group a multi-selection into a GROUP, or dissolve a selected GROUP. The button row
+// mirrors the ⌘G / ⌘⇧G canvas shortcuts so the action is discoverable in the panel.
+function GroupActions({
+  kind,
+  ids,
+  disabled,
+}: {
+  kind: "group" | "ungroup";
+  ids: NodeId[];
+  disabled: boolean;
+}) {
+  return (
+    <Row label={kind === "group" ? "Group" : "Group"}>
+      {kind === "group" ? (
+        <button
+          disabled={disabled}
+          onClick={() => sendTool("groupNodes", { ids })}
+          style={{ ...tabButton, width: "100%", borderColor: "var(--border)" }}
+        >
+          Group selection ⌘G
+        </button>
+      ) : (
+        <button
+          disabled={disabled}
+          onClick={() => sendTool("ungroupNodes", { id: ids[0] })}
+          style={{ ...tabButton, width: "100%", borderColor: "var(--border)" }}
+        >
+          Ungroup ⌘⇧G
+        </button>
+      )}
+    </Row>
+  );
+}
+
+// Auto-layout (baked): pick a direction + distribution and the children re-flow into
+// absolute positions via applyAutoLayout. Each control re-bakes immediately, reading the
+// node's current layout so unrelated settings persist. Children stay freely draggable.
+function AutoLayoutFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const L = node.layout;
+  const mode = L?.mode ?? "NONE";
+  const dir: "H" | "V" = mode === "VERTICAL" ? "V" : "H";
+  const gap = L?.gap ?? 16;
+  const padding = L?.padding ?? 24;
+  const align = L?.align ?? "START";
+  const justify = L?.justify ?? "START";
+  const noKids = node.children.length === 0;
+  const off = disabled || noKids;
+
+  // Re-bake with the current settings, overriding just the changed field.
+  const reflow = (patch: Partial<{ dir: "H" | "V"; gap: number; padding: number; align: string; justify: string }>) => {
+    sendTool("applyAutoLayout", {
+      frame: node.id,
+      dir: patch.dir ?? dir,
+      gap: patch.gap ?? gap,
+      padding: patch.padding ?? padding,
+      align: patch.align ?? align,
+      justify: patch.justify ?? justify,
+    });
+  };
+
+  return (
+    <Row label="Auto Layout">
+      {noKids && <div style={{ ...hint, marginBottom: 6 }}>Add children to lay out.</div>}
+      {/* Direction: None keeps positions; Row / Column re-flow the children. */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, marginBottom: 6 }}>
+        {(["NONE", "H", "V"] as const).map((d) => {
+          const active = d === "NONE" ? mode === "NONE" : dir === d && mode !== "NONE";
+          return (
+            <button
+              key={d}
+              disabled={disabled || (d !== "NONE" && noKids)}
+              onClick={() => {
+                if (d === "NONE") sendTool("setProps", { id: node.id, patch: { "layout.mode": "NONE" } });
+                else reflow({ dir: d });
+              }}
+              style={{
+                ...tabButton,
+                background: active ? "var(--text)" : "#fff",
+                color: active ? "#fff" : "var(--muted)",
+                borderColor: active ? "var(--text)" : "var(--border)",
+              }}
+            >
+              {d === "NONE" ? "None" : d === "H" ? "Row" : "Column"}
+            </button>
+          );
+        })}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+        <select
+          value={justify}
+          disabled={off}
+          onChange={(e) => reflow({ justify: e.target.value })}
+          style={{ ...input, width: "100%" }}
+          title="Distribute along the main axis (justify-content)"
+        >
+          <option value="START">Justify: Start</option>
+          <option value="CENTER">Justify: Center</option>
+          <option value="END">Justify: End</option>
+          <option value="SPACE_BETWEEN">Space between</option>
+          <option value="SPACE_AROUND">Space around</option>
+        </select>
+        <select
+          value={align}
+          disabled={off}
+          onChange={(e) => reflow({ align: e.target.value })}
+          style={{ ...input, width: "100%" }}
+          title="Cross-axis alignment (align-items)"
+        >
+          <option value="START">Align: Start</option>
+          <option value="CENTER">Align: Center</option>
+          <option value="END">Align: End</option>
+        </select>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <NumField label="Gap" initial={gap} disabled={off} onCommit={(r) => {
+          const v = Number(r);
+          if (r.trim() !== "" && !Number.isNaN(v) && v !== gap) reflow({ gap: v });
+        }} />
+        <NumField label="Pad" initial={padding} disabled={off} onCommit={(r) => {
+          const v = Number(r);
+          if (r.trim() !== "" && !Number.isNaN(v) && v !== padding) reflow({ padding: v });
+        }} />
+      </div>
+    </Row>
+  );
+}
+
 function LayoutFields({ node, disabled }: { node: Node; disabled: boolean }) {
   const display = node.layout?.display ?? (node.type === "FRAME" ? "flex" : "block");
   const mode = node.layout?.mode ?? "NONE";
@@ -490,6 +624,92 @@ function LayoutFields({ node, disabled }: { node: Node; disabled: boolean }) {
         </div>
       </Row>
     </>
+  );
+}
+
+function SelfLayoutFields({ node, disabled }: { node: Node; disabled: boolean }) {
+  const widthMode = node.layout?.widthMode ?? "fixed";
+  const heightMode = node.layout?.heightMode ?? "fixed";
+  const alignSelf = node.layout?.alignSelf ?? "auto";
+  const grow = node.layout?.grow ?? 0;
+  const parent = node.parent ? docMirror.store.getNode(node.parent) : null;
+  const parentMode = parent?.layout?.mode;
+  const snapsParent = !!parent && (parentMode === "HORIZONTAL" || parentMode === "VERTICAL");
+
+  const commit = (patch: {
+    widthMode?: string;
+    heightMode?: string;
+    alignSelf?: string;
+    grow?: number;
+  }) => {
+    if (snapsParent) {
+      sendTool("snapIntoLayout", {
+        id: node.id,
+        parent: parent!.id,
+        index: parent!.children.indexOf(node.id),
+        ...patch,
+      });
+      return;
+    }
+    const propPatch: Record<string, unknown> = {};
+    if (patch.widthMode != null) propPatch["layout.widthMode"] = patch.widthMode;
+    if (patch.heightMode != null) propPatch["layout.heightMode"] = patch.heightMode;
+    if (patch.alignSelf != null) propPatch["layout.alignSelf"] = patch.alignSelf;
+    if (patch.grow != null) propPatch["layout.grow"] = patch.grow;
+    if (Object.keys(propPatch).length) sendTool("setProps", { id: node.id, patch: propPatch });
+  };
+
+  return (
+    <Row label="Self Layout">
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+        <select
+          value={widthMode}
+          disabled={disabled}
+          onChange={(e) => commit({ widthMode: e.target.value })}
+          style={{ ...input, width: "100%" }}
+          title="Width sizing"
+        >
+          <option value="fixed">W: Fixed</option>
+          <option value="hug">W: Hug</option>
+          <option value="fill">W: Fill</option>
+        </select>
+        <select
+          value={heightMode}
+          disabled={disabled}
+          onChange={(e) => commit({ heightMode: e.target.value })}
+          style={{ ...input, width: "100%" }}
+          title="Height sizing"
+        >
+          <option value="fixed">H: Fixed</option>
+          <option value="hug">H: Hug</option>
+          <option value="fill">H: Fill</option>
+        </select>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <select
+          value={alignSelf}
+          disabled={disabled}
+          onChange={(e) => commit({ alignSelf: e.target.value })}
+          style={{ ...input, width: "100%" }}
+          title="Cross-axis self alignment"
+        >
+          <option value="auto">Self: Auto</option>
+          <option value="stretch">Stretch</option>
+          <option value="flex-start">Start</option>
+          <option value="center">Center</option>
+          <option value="flex-end">End</option>
+        </select>
+        <NumField
+          label="Grow"
+          initial={grow}
+          disabled={disabled}
+          onCommit={(raw) => {
+            const v = Number(raw);
+            if (raw.trim() !== "" && !Number.isNaN(v) && v >= 0 && v !== grow) commit({ grow: v });
+          }}
+        />
+      </div>
+    </Row>
   );
 }
 
@@ -582,7 +802,7 @@ function DebugFields({ node }: { node: Node }) {
 function nodeToDeclarations(node: Node): string {
   const [x, y, w, h] = node.bbox;
   const lines = [`@name: ${node.name}`, `left: ${x}px`, `top: ${y}px`, `width: ${w}px`, `height: ${h}px`];
-  const fill = node.type === "VECTOR" ? node.vector?.fill : node.style?.fills?.[0]?.color;
+  const fill = node.type === "VECTOR" ? node.vector?.fill : paintColor(node.style?.fills?.[0]);
   if (fill) lines.push(`fill: ${fill}`);
   const stroke = node.type === "VECTOR" ? node.vector?.stroke : node.style?.stroke?.color;
   if (stroke) lines.push(`stroke: ${stroke}`);

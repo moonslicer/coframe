@@ -1,7 +1,54 @@
 // The document store: the ONE write path (commit), boundary validation, and the
 // pure applyOps reducer. Mirrors IMPLEMENTATION.md §5.1.
 
+import type { BBox } from "./primitives.js";
 import type { DocVersion, Node, NodeId, Op, ToolResult } from "./types.js";
+
+/** The bbox that frames ALL content — root frame UNIONed with every node's bbox.
+ *  WHY: both projections (server raster + browser canvas) used to set their viewBox
+ *  to root.bbox alone, so any node positioned OUTSIDE the root frame was invisible to
+ *  both the agent and the human. Escaped nodes must stay perceivable/visible, so we
+ *  expand to cover them. Pure & deterministic (no Math.random / Date). When everything
+ *  is already inside the root frame this returns root.bbox EXACTLY (no behavior change
+ *  for existing seeds) — it only differs when content escapes. */
+export function contentBounds(store: DocStore, rootId: NodeId): BBox {
+  const root = store.getNode(rootId);
+  if (!root) return [0, 0, 0, 0];
+  let [minX, minY, w, h] = root.bbox;
+  let maxRight = minX + w;
+  let maxBottom = minY + h;
+  for (const n of store.all().values()) {
+    const [x, y, bw, bh] = n.bbox;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x + bw > maxRight) maxRight = x + bw;
+    if (y + bh > maxBottom) maxBottom = y + bh;
+  }
+  return [minX, minY, maxRight - minX, maxBottom - minY];
+}
+
+/** The bbox covering a single subtree (node UNIONed with all its descendants).
+ *  Used by Play mode to frame ONE screen (contentBounds would union every screen on the
+ *  canvas). Falls back to the node's own bbox when it has no children. Pure & deterministic. */
+export function boundsOf(store: DocStore, rootId: NodeId): BBox {
+  const root = store.getNode(rootId);
+  if (!root) return [0, 0, 0, 0];
+  let [minX, minY, w, h] = root.bbox;
+  let maxRight = minX + w;
+  let maxBottom = minY + h;
+  const walk = (id: NodeId) => {
+    const n = store.getNode(id);
+    if (!n) return;
+    const [x, y, bw, bh] = n.bbox;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x + bw > maxRight) maxRight = x + bw;
+    if (y + bh > maxBottom) maxBottom = y + bh;
+    for (const c of n.children) walk(c);
+  };
+  walk(rootId);
+  return [minX, minY, maxRight - minX, maxBottom - minY];
+}
 
 /** Pure reducer. Clones the whole map (demo docs are small) so a snapshot can
  *  never be mutated by reference. */

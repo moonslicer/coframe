@@ -17,6 +17,7 @@ dotenv.config({ override: true });
 
 import { DocStore } from "../shared/store.js";
 import type { Node, NodeId } from "../shared/types.js";
+import { paintColor } from "../shared/types.js";
 import { SEEDS, SEED_PROMPTS } from "../shared/seed.js";
 import type { Seed } from "../shared/seed.js";
 import { RunController } from "./run-controller.js";
@@ -192,10 +193,10 @@ const CASES: EvalCase[] = [
       const ids = ["node:btnPrimary", "node:btnSecondary", "node:btnTertiary"];
       const btns = ids.map((i) => store.getNode(i)!).filter(Boolean);
       const primary = store.getNode("node:btnPrimary")!;
-      const primaryColor = primary?.style?.fills?.[0]?.color;
+      const primaryColor = paintColor(primary?.style?.fills?.[0]);
       const allMatch =
         !!primaryColor &&
-        btns.every((b) => b.style?.fills?.[0]?.color === primaryColor);
+        btns.every((b) => paintColor(b.style?.fills?.[0]) === primaryColor);
       return [
         {
           name: "all three buttons still exist",
@@ -205,7 +206,7 @@ const CASES: EvalCase[] = [
         {
           name: "all three buttons share the primary fill color",
           ok: allMatch,
-          detail: `colors=[${btns.map((b) => b.style?.fills?.[0]?.color).join(", ")}]`,
+          detail: `colors=[${btns.map((b) => paintColor(b.style?.fills?.[0])).join(", ")}]`,
         },
         {
           name: "buttons are evenly spaced in a row OR top-aligned",

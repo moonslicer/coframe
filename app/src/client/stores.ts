@@ -9,9 +9,10 @@ import { useSyncExternalStore } from "react";
 import { DocStore } from "../shared/store.js";
 import { applyOps } from "../shared/store.js";
 import type { Node, NodeId, Op } from "../shared/types.js";
+import type { DesignSystemProfile } from "../shared/design-system.js";
 import type { BBox } from "./canvas-math.js";
 import type { RunPhase } from "../agent/run-controller.js";
-import type { ServerMessage } from "../shared/protocol.js";
+import type { ClarificationRequestMessage, ServerMessage } from "../shared/protocol.js";
 
 // ---------------------------------------------------------------------------
 // Doc mirror — a READ-ONLY DocStore the browser renders from. Patched from
@@ -163,6 +164,9 @@ export interface RunState {
   marks: MarksBeat | null;
   history: HistoryEntry[];
   banner: string | null; // single-writer rejection / transient notice
+  clarification: ClarificationRequestMessage | null;
+  designSystem: DesignSystemProfile | null;
+  designSystemError: string | null;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -175,6 +179,9 @@ class RunStore {
     marks: null,
     history: [],
     banner: null,
+    clarification: null,
+    designSystem: null,
+    designSystemError: null,
     canUndo: false,
     canRedo: false,
   };
@@ -197,6 +204,8 @@ class RunStore {
       activity: [],
       marks: null,
       banner: null,
+      clarification: null,
+      designSystemError: null,
     });
   }
   setBanner(text: string | null) {
@@ -211,6 +220,7 @@ class RunStore {
       marks: null,
       history: [],
       banner: null,
+      clarification: null,
       canUndo: false,
       canRedo: false,
     });
@@ -290,6 +300,22 @@ class RunStore {
       case "rejected":
         this.set({ banner: e.reason });
         break;
+      case "clarification-request":
+        this.set({
+          phase: "IDLE",
+          planLabels: [],
+          activity: [],
+          marks: null,
+          banner: null,
+          clarification: e,
+        });
+        break;
+      case "design-system":
+        this.set({
+          designSystem: e.designSystem,
+          designSystemError: e.error ?? null,
+        });
+        break;
     }
   }
 }
@@ -347,4 +373,188 @@ export function setToolMode(m: ToolMode): void {
 
 export function useToolMode(): ToolMode {
   return useSyncExternalStore(toolModeStore.subscribe, toolModeStore.getSnapshot);
+}
+
+// ---------------------------------------------------------------------------
+// Play mode — the prototype RUNTIME (client-only, read-only over the mirror).
+// Holds which screen is shown, the navigation stack (for `back`), the open
+// overlay stack, and the set of nodes whose default `hidden` is toggled. Never
+// mutates the doc or sends tools — single-writer is preserved.
+// ---------------------------------------------------------------------------
+export interface PlayState {
+  active: boolean;
+  currentScreen: NodeId | null;
+  navStack: NodeId[]; // screens visited before currentScreen (back pops this)
+  overlays: NodeId[]; // open overlays, bottom→top
+  toggled: NodeId[]; // nodes whose `hidden` default is flipped this screen
+}
+
+const IDLE_PLAY: PlayState = {
+  active: false,
+  currentScreen: null,
+  navStack: [],
+  overlays: [],
+  toggled: [],
+};
+
+class PlayStore {
+  private state: PlayState = IDLE_PLAY;
+  private listeners = new Set<() => void>();
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  };
+  getState = (): PlayState => this.state;
+  private set(next: Partial<PlayState>) {
+    this.state = { ...this.state, ...next };
+    for (const l of this.listeners) l();
+  }
+
+  enter(entryScreen: NodeId) {
+    this.state = { active: true, currentScreen: entryScreen, navStack: [], overlays: [], toggled: [] };
+    for (const l of this.listeners) l();
+  }
+  exit() {
+    this.state = IDLE_PLAY;
+    for (const l of this.listeners) l();
+  }
+  /** Go to a screen: remember the current one for `back`, and reset per-screen overlay/toggle state. */
+  navigate(target: NodeId) {
+    if (!this.state.currentScreen || target === this.state.currentScreen) {
+      this.set({ overlays: [], toggled: [] });
+      return;
+    }
+    this.set({
+      currentScreen: target,
+      navStack: [...this.state.navStack, this.state.currentScreen],
+      overlays: [],
+      toggled: [],
+    });
+  }
+  back() {
+    // An open overlay swallows back first (closes it); otherwise pop the screen stack.
+    if (this.state.overlays.length) return this.closeOverlay();
+    const stack = this.state.navStack;
+    if (!stack.length) return;
+    this.set({
+      currentScreen: stack[stack.length - 1],
+      navStack: stack.slice(0, -1),
+      overlays: [],
+      toggled: [],
+    });
+  }
+  toggle(target: NodeId) {
+    const has = this.state.toggled.includes(target);
+    this.set({
+      toggled: has ? this.state.toggled.filter((x) => x !== target) : [...this.state.toggled, target],
+    });
+  }
+  openOverlay(target: NodeId) {
+    if (this.state.overlays.includes(target)) return;
+    this.set({ overlays: [...this.state.overlays, target] });
+  }
+  closeOverlay() {
+    if (!this.state.overlays.length) return;
+    this.set({ overlays: this.state.overlays.slice(0, -1) });
+  }
+}
+
+export const playStore = new PlayStore();
+
+export function usePlayState(): PlayState {
+  return useSyncExternalStore(playStore.subscribe, playStore.getState);
+}
+
+// ---------------------------------------------------------------------------
+// Form store — Play-mode VARIABLE state (field -> typed value). Like playStore it
+// is client-only and read-only over the doc mirror: form values are runtime state,
+// never committed, so the single-writer guarantee holds. Reset (seeded with each
+// input's defaultValue) every time Play mode is entered. `{{field}}` text and input
+// boxes read it back through buildSvg's play.values.
+// ---------------------------------------------------------------------------
+class FormStore {
+  // A single object reference, REPLACED on every change so useSyncExternalStore's
+  // snapshot identity is stable between renders (no tearing / infinite loop).
+  private values: Record<string, string> = {};
+  private listeners = new Set<() => void>();
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  };
+  getValues = (): Record<string, string> => this.values;
+  private notify() {
+    for (const l of this.listeners) l();
+  }
+
+  /** Reset to a fresh session, seeded with any `defaultValue`s. */
+  reset(defaults: Record<string, string> = {}) {
+    this.values = { ...defaults };
+    this.notify();
+  }
+  set(field: string, value: string) {
+    if (this.values[field] === value) return;
+    this.values = { ...this.values, [field]: value };
+    this.notify();
+  }
+  get(field: string): string {
+    return this.values[field] ?? "";
+  }
+}
+
+export const formStore = new FormStore();
+
+export function usePlayValues(): Record<string, string> {
+  return useSyncExternalStore(formStore.subscribe, formStore.getValues);
+}
+
+/** Every input node in the doc, with its field default — seeds formStore on Play enter. */
+export function inputDefaults(store: DocStore): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const n of store.all().values()) {
+    if (n.input) out[n.input.field] = n.input.defaultValue ?? "";
+  }
+  return out;
+}
+
+/** Input nodes inside `rootId` that are visible in Play (respecting the hidden predicate). */
+export function visibleInputs(
+  store: DocStore,
+  rootId: NodeId,
+  isHidden: (id: NodeId) => boolean,
+): Node[] {
+  const out: Node[] = [];
+  const walk = (id: NodeId) => {
+    const n = store.getNode(id);
+    if (!n) return;
+    if (id !== rootId && isHidden(id)) return;
+    if (n.input) out.push(n);
+    for (const c of n.children) walk(c);
+  };
+  walk(rootId);
+  return out;
+}
+
+/** Required input fields under `rootId` that are still empty — blocks a 'navigate'. */
+export function missingRequired(
+  store: DocStore,
+  rootId: NodeId,
+  isHidden: (id: NodeId) => boolean,
+): Node[] {
+  return visibleInputs(store, rootId, isHidden).filter(
+    (n) => n.input!.required && formStore.get(n.input!.field).trim() === "",
+  );
+}
+
+/** Top-level screens (direct children of root flagged `screen`), in document order. */
+export function screensOf(store: DocStore): NodeId[] {
+  const root = store.getNode(store.rootId);
+  if (!root) return [];
+  return root.children.filter((id) => store.getNode(id)?.screen);
+}
+
+/** The prototype entry point: the first screen, or null when the doc has none. */
+export function entryScreen(store: DocStore): NodeId | null {
+  return screensOf(store)[0] ?? null;
 }
